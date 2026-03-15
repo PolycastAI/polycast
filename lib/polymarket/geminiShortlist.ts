@@ -20,7 +20,7 @@ Select 20 markets from the list provided. Your selection must:
 - Prioritise markets that are genuinely uncertain, interesting to forecast, and likely to generate engagement — markets in the news, markets with recent volume spikes, markets where reasonable people disagree
 - Avoid duplicate topics — don't pick two markets about the same underlying event
 
-Return ONLY a valid JSON array with no markdown, no preamble. Each object must have only: id, question, crowd_price (YES probability as integer 0-100), endDate (ISO string), volume (number).`;
+Return ONLY a valid JSON array with no markdown, no preamble. Each object must have only: id, question, crowd_price (YES probability as integer 0-100), endDate (ISO string), volume (number). In the JSON: use no newlines inside string values, and escape any double-quotes inside question text with a backslash (e.g. \\").`;
 
 /** Raw market row we send to Gemini (no description). */
 export interface StrippedMarket {
@@ -100,6 +100,57 @@ function stripMarkets(raw: GammaMarket[]): StrippedMarket[] {
   return out;
 }
 
+/**
+ * Parse Gemini's response into a JSON array. Handles markdown fences, leading/trailing text,
+ * and truncated or slightly malformed JSON (e.g. unterminated string at end).
+ */
+function parseGeminiJsonArray(raw: string): unknown[] {
+  let text = raw.replace(/```json?\s*/i, "").replace(/```\s*$/, "").trim();
+  // Remove control characters that can break JSON (e.g. U+2028 line separator)
+  text = text.replace(/[\u0000-\u001F\u2028\u2029]/g, (m) => (m === "\n" || m === "\r" || m === "\t" ? m : " "));
+  const firstBracket = text.indexOf("[");
+  if (firstBracket === -1) return [];
+  text = text.slice(firstBracket);
+  const lastBracket = text.lastIndexOf("]");
+  if (lastBracket !== -1) text = text.slice(0, lastBracket + 1);
+
+  const tryParse = (str: string): unknown[] | null => {
+    try {
+      const out = JSON.parse(str);
+      return Array.isArray(out) ? out : [];
+    } catch {
+      return null;
+    }
+  };
+
+  let result = tryParse(text);
+  if (result != null) return result;
+
+  // Fix unescaped newlines in response (common cause of "Unterminated string")
+  const noNewlines = text.replace(/\r\n/g, " ").replace(/\n/g, " ").replace(/\r/g, " ");
+  result = tryParse(noNewlines);
+  if (result != null) return result;
+
+  // Truncate at last complete object boundary to recover partial array
+  for (let i = text.length - 1; i > 0; i--) {
+    if (text[i] === "}" && (text[i + 1] === "," || text[i + 1] === "]")) {
+      const truncated = text.slice(0, i + 1) + "]";
+      result = tryParse(truncated);
+      if (result != null) return result;
+    }
+  }
+  for (let i = text.length - 1; i > 0; i--) {
+    if (text[i] === "}") {
+      const truncated = text.slice(0, i + 1) + "]";
+      result = tryParse(truncated);
+      if (result != null) return result;
+    }
+  }
+
+  console.warn("[geminiShortlist] Could not parse Gemini JSON; raw slice:", text.slice(0, 800));
+  return [];
+}
+
 /** Call Gemini for N selections from the given list. Returns array of { id, question, crowd_price, endDate, volume }. */
 async function callGeminiForSelection(
   strippedList: StrippedMarket[],
@@ -139,13 +190,7 @@ async function callGeminiForSelection(
 
   const text =
     json?.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text).join("") ?? "";
-  const trimmed = text.replace(/^[\s\S]*?\[/, "[").replace(/\][\s\S]*$/, "]");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    parsed = JSON.parse(text.replace(/```json?\s*/i, "").replace(/```\s*$/, "").trim());
-  }
+  const parsed = parseGeminiJsonArray(text);
   const arr = Array.isArray(parsed) ? parsed : [];
   return arr
     .map((o: any) => ({
