@@ -437,13 +437,21 @@ export async function runShortlistAndNotifyOnly() {
         time_bucket: m.time_bucket
       });
     }
-    // Replace pending list with only this shortlist: mark current pending as superseded, then upsert new ones.
-    await supabaseAdmin
-      .from("markets")
-      .update({ status: "superseded" })
-      .eq("status", "pending");
+    // Upsert the new shortlist, then remove any other pending markets so admin shows only these.
+    const newIds: string[] = [];
     for (const m of shortlist.markets) {
-      await upsertMarketFromShortlist(m);
+      const id = await upsertMarketFromShortlist(m);
+      newIds.push(id);
+    }
+    if (newIds.length > 0) {
+      const { error: delErr } = await supabaseAdmin
+        .from("markets")
+        .delete()
+        .eq("status", "pending")
+        .not("id", "in", `("${newIds.join('","')}")`);
+      if (delErr) {
+        console.error("Failed to clear old pending markets:", delErr);
+      }
     }
     await sendTelegramMessage(
       `Polycast shortlist ready.\n` +
