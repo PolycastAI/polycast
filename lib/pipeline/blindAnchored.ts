@@ -437,13 +437,14 @@ export async function runShortlistAndNotifyOnly() {
         time_bucket: m.time_bucket
       });
     }
-    // Delete all pending markets first, then add only the new shortlist.
-    const { error: delErr } = await supabaseAdmin
+    // Can't DELETE pending (predictions FK). Mark all pending as superseded, then add only the new shortlist.
+    const { error: updateErr } = await supabaseAdmin
       .from("markets")
-      .delete()
+      .update({ status: "superseded" })
       .eq("status", "pending");
-    if (delErr) {
-      console.error("Failed to delete old pending markets:", delErr);
+    if (updateErr) {
+      console.error("Failed to supersede old pending:", updateErr);
+      throw updateErr;
     }
     for (const m of shortlist.markets) {
       await upsertMarketFromShortlist(m);
