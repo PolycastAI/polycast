@@ -437,6 +437,11 @@ export async function runShortlistAndNotifyOnly() {
         time_bucket: m.time_bucket
       });
     }
+    // Replace pending list with only this shortlist: mark current pending as superseded, then upsert new ones.
+    await supabaseAdmin
+      .from("markets")
+      .update({ status: "superseded" })
+      .eq("status", "pending");
     for (const m of shortlist.markets) {
       await upsertMarketFromShortlist(m);
     }
