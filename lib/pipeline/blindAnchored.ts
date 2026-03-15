@@ -437,17 +437,27 @@ export async function runShortlistAndNotifyOnly() {
         time_bucket: m.time_bucket
       });
     }
-    // Step 7: Clean stale data before writing new shortlist. Do not touch approved/rejected.
+    // Step 7: Clear held_markets, then write new shortlist, then remove any other pending/held so only the new ones remain.
     const { data: heldIds } = await supabaseAdmin.from("held_markets").select("id");
     if (heldIds?.length) {
       await supabaseAdmin.from("held_markets").delete().in("id", heldIds.map((r: any) => r.id));
     }
-    const { error: delPendingErr } = await supabaseAdmin.from("markets").delete().eq("status", "pending");
-    if (delPendingErr) console.error("Delete pending:", delPendingErr);
-    const { error: delHeldErr } = await supabaseAdmin.from("markets").delete().eq("status", "held");
-    if (delHeldErr) console.error("Delete held:", delHeldErr);
+    const newIds: string[] = [];
     for (const m of shortlist.markets) {
-      await upsertMarketFromShortlist(m);
+      const id = await upsertMarketFromShortlist(m);
+      newIds.push(id);
+    }
+    if (newIds.length > 0) {
+      const { data: oldPending } = await supabaseAdmin.from("markets").select("id").eq("status", "pending");
+      const idsToRemove = (oldPending ?? []).filter((r: any) => !newIds.includes(r.id)).map((r: any) => r.id);
+      if (idsToRemove.length > 0) {
+        await supabaseAdmin.from("markets").delete().in("id", idsToRemove);
+      }
+      const { data: oldHeld } = await supabaseAdmin.from("markets").select("id").eq("status", "held");
+      const heldIdsToRemove = (oldHeld ?? []).map((r: any) => r.id);
+      if (heldIdsToRemove.length > 0) {
+        await supabaseAdmin.from("markets").delete().in("id", heldIdsToRemove);
+      }
     }
     await sendTelegramMessage(
       `Polycast shortlist ready.\n` +
