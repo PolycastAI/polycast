@@ -6,8 +6,8 @@ export const dynamic = "force-dynamic";
 
 export async function POST() {
   try {
-    await runShortlistAndNotifyOnly();
-    return NextResponse.json({ ok: true });
+    const result = await runShortlistAndNotifyOnly();
+    return NextResponse.json({ ok: true, count: result?.count ?? 0 });
   } catch (error: unknown) {
     console.error("Admin fetch-shortlist error:", error);
     const msg =

@@ -1,46 +1,39 @@
 import { AdminDashboard } from "@/components/admin/AdminDashboard";
 import { supabaseAdmin } from "@/lib/supabase/server";
+import { getTimeBucket } from "@/lib/markets/timeBuckets";
 
-// Always load fresh data so pending list updates after "Fetch shortlist"
 export const dynamic = "force-dynamic";
 
 async function getAdminData() {
   try {
-    const { data: pending, error: pendingError } = await supabaseAdmin
+    const { data: pendingRows, error: pendingError } = await supabaseAdmin
       .from("markets")
-      .select("id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, created_at")
+      .select("id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at")
       .eq("status", "pending")
       .order("created_at", { ascending: false });
 
-    const { data: insufficientSignals, error: rejectedError } =
-      await supabaseAdmin
-        .from("rejected_markets")
-        .select("id, market_id, rejected_at, resurface_at, rejection_reason")
-        .eq("rejection_reason", "insufficient_signals")
-        .order("rejected_at", { ascending: false })
-        .limit(100);
-
-    const { data: held, error: heldError } = await supabaseAdmin
-      .from("held_markets")
-      .select("*")
-      .order("held_at", { ascending: false })
-      .limit(100);
+    const now = new Date();
+    const pending = (pendingError ? [] : (pendingRows ?? [])).map((row: any) => {
+      const resolutionDate = row.resolution_date ? new Date(row.resolution_date) : null;
+      const { daysToResolution, timeBucket } = getTimeBucket(now, resolutionDate);
+      return {
+        ...row,
+        days_to_resolution: daysToResolution,
+        time_bucket: timeBucket
+      };
+    });
 
     return {
-      pending: pendingError ? [] : (pending ?? []),
-      insufficientSignals: rejectedError ? [] : (insufficientSignals ?? []),
-      held: heldError ? [] : (held ?? [])
+      pending,
+      held: []
     };
   } catch {
-    return { pending: [], insufficientSignals: [], held: [] };
+    return { pending: [], held: [] };
   }
 }
 
 export default async function AdminPage() {
-  const { pending, insufficientSignals, held } = await getAdminData();
-
-  // Bing API usage wiring will come later; 0 for now.
-  const bingMonthlyCalls = 0;
+  const { pending, held } = await getAdminData();
 
   return (
     <main className="min-h-screen px-6 py-10 md:px-12 lg:px-24">
@@ -50,17 +43,11 @@ export default async function AdminPage() {
             Polycast Admin
           </h1>
           <p className="mt-2 max-w-xl text-sm text-slate-400">
-            Morning pipeline candidates land here for human approval before
-            going live to Polycast and Bluesky.
+            Run the pipeline to fetch markets, then approve, hold, or reject each.
           </p>
         </div>
       </header>
-      <AdminDashboard
-        pending={pending}
-        insufficientSignals={insufficientSignals}
-        held={held}
-        bingMonthlyCalls={bingMonthlyCalls}
-      />
+      <AdminDashboard pending={pending} held={held} />
     </main>
   );
 }

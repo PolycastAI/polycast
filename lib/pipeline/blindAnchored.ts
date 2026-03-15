@@ -437,15 +437,15 @@ export async function runShortlistAndNotifyOnly() {
         time_bucket: m.time_bucket
       });
     }
-    // Can't DELETE pending (predictions FK). Mark all pending as superseded, then add only the new shortlist.
-    const { error: updateErr } = await supabaseAdmin
-      .from("markets")
-      .update({ status: "superseded" })
-      .eq("status", "pending");
-    if (updateErr) {
-      console.error("Failed to supersede old pending:", updateErr);
-      throw updateErr;
+    // Step 7: Clean stale data before writing new shortlist. Do not touch approved/rejected.
+    const { data: heldIds } = await supabaseAdmin.from("held_markets").select("id");
+    if (heldIds?.length) {
+      await supabaseAdmin.from("held_markets").delete().in("id", heldIds.map((r: any) => r.id));
     }
+    const { error: delPendingErr } = await supabaseAdmin.from("markets").delete().eq("status", "pending");
+    if (delPendingErr) console.error("Delete pending:", delPendingErr);
+    const { error: delHeldErr } = await supabaseAdmin.from("markets").delete().eq("status", "held");
+    if (delHeldErr) console.error("Delete held:", delHeldErr);
     for (const m of shortlist.markets) {
       await upsertMarketFromShortlist(m);
     }
@@ -455,6 +455,7 @@ export async function runShortlistAndNotifyOnly() {
         `Open /admin to approve markets, then run the "Run approved" job.`
     );
     console.log("Shortlist + notify finished.");
+    return { count: shortlist.markets.length };
   } catch (err) {
     const msg =
       err instanceof Error
@@ -538,5 +539,50 @@ export async function runPromptsForApprovedMarkets() {
     }
   }
   console.log("Prompts for approved markets finished.");
+}
+
+/** Run prompt pipeline for a single market (e.g. after Approve in admin). */
+export async function runPromptsForMarketId(marketId: string): Promise<void> {
+  const { getTimeBucket } = await import("@/lib/markets/timeBuckets");
+  const { fetchMarketById } = await import("@/lib/polymarket/gamma");
+  await ensurePromptVersionRow();
+  const { data: market, error } = await supabaseAdmin
+    .from("markets")
+    .select("id, polymarket_id, title, social_title, resolution_date, category, market_url")
+    .eq("id", marketId)
+    .single();
+  if (error || !market) throw new Error("Market not found");
+  const gamma = await fetchMarketById((market as any).polymarket_id);
+  let prob = 0.5;
+  let vol = 0;
+  if (gamma && !(gamma as any).closed) {
+    const outcomes = (gamma as any).outcomes;
+    const prices = (gamma as any).outcomePrices;
+    if (outcomes && prices) {
+      const o = Array.isArray(outcomes) ? outcomes : JSON.parse(outcomes);
+      const p = Array.isArray(prices) ? prices : JSON.parse(prices);
+      const yesIdx = o.findIndex((x: string) => String(x).toLowerCase() === "yes");
+      if (yesIdx >= 0 && p[yesIdx] != null) prob = Number(p[yesIdx]);
+    }
+    vol = (gamma as any).volume ? Number((gamma as any).volume) : 0;
+  }
+  const resolutionDate = (market as any).resolution_date
+    ? new Date((market as any).resolution_date)
+    : null;
+  const { daysToResolution, timeBucket } = getTimeBucket(new Date(), resolutionDate);
+  const m = {
+    polymarketId: (market as any).polymarket_id,
+    title: (market as any).title,
+    category: (market as any).category,
+    probability: prob,
+    volume: vol,
+    resolutionDate,
+    daysToResolution,
+    timeBucket,
+    marketUrl: (market as any).market_url ?? `https://polymarket.com/market/${(market as any).polymarket_id}`
+  };
+  await runBlindAndAnchoredForMarketWithId(marketId, m, {
+    socialTitle: (market as any).social_title
+  });
 }
 
