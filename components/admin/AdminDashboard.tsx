@@ -146,7 +146,7 @@ export function AdminDashboard({ pending: initialPending, held }: Props) {
                   <p className="text-xs text-slate-400">
                     <span className="font-medium text-slate-300">Resolution:</span>{" "}
                     {m.resolution_date
-                      ? new Date(m.resolution_date).toLocaleDateString(undefined, {
+                      ? new Date(m.resolution_date).toLocaleString(undefined, {
                           dateStyle: "medium",
                           timeStyle: "short"
                         })
