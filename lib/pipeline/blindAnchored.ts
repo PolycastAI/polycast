@@ -437,15 +437,27 @@ export async function runShortlistAndNotifyOnly() {
         time_bucket: m.time_bucket
       });
     }
-    // Step 7: Hard reset pending/held before writing shortlist.
-    await supabaseAdmin.from("held_markets").delete().neq("market_id", "");
-    await supabaseAdmin.from("markets").delete().in("status", ["pending", "held"]);
+    // Step 7: Atomic reset + insert via DB function so cleanup and write happen together.
+    console.log("PIPELINE START — deleting pending markets (inside reset_and_insert_shortlist)");
+    const payload = shortlist.markets.map((m) => ({
+      polymarket_id: m.polymarketId,
+      title: m.title,
+      category: m.category ?? null,
+      resolution_date: m.resolutionDate ? m.resolutionDate.toISOString() : null,
+      resolution_criteria: m.description ?? null,
+      market_url: m.marketUrl ?? null,
+      current_price: m.probability ?? null,
+      volume: m.volume ?? null
+    }));
 
-    const newIds: string[] = [];
-    for (const m of shortlist.markets) {
-      const id = await upsertMarketFromShortlist(m);
-      newIds.push(id);
+    const { error: resetError } = await supabaseAdmin.rpc("reset_and_insert_shortlist", {
+      new_markets: payload
+    });
+    if (resetError) {
+      console.error("reset_and_insert_shortlist failed:", resetError);
+      throw resetError;
     }
+    console.log("DELETED — now writing new markets (completed inside reset_and_insert_shortlist)");
 
     const { count: pendingCount } = await supabaseAdmin
       .from("markets")

@@ -26,10 +26,11 @@ interface HeldRow {
 
 interface Props {
   pending: AdminMarket[];
+  pendingCount: number;
   held: HeldRow[];
 }
 
-export function AdminDashboard({ pending: initialPending, held }: Props) {
+export function AdminDashboard({ pending: initialPending, pendingCount, held }: Props) {
   const [pending, setPending] = useState(initialPending);
   const [pipelineBusy, setPipelineBusy] = useState(false);
   const [pipelineMessage, setPipelineMessage] = useState<string | null>(null);
@@ -113,8 +114,13 @@ export function AdminDashboard({ pending: initialPending, held }: Props) {
 
       <section>
         <h2 className="mb-3 text-lg font-semibold text-slate-100">
-          Pending markets ({pending.length})
+          Pending markets ({pending.length}{pending.length !== pendingCount ? ` of ${pendingCount}` : ""})
         </h2>
+        {pending.length !== pendingCount && pendingCount > 0 && (
+          <p className="mb-2 text-sm text-amber-400">
+            DB has {pendingCount} pending; only {pending.length} loaded. Refresh or check server logs.
+          </p>
+        )}
         {pending.length === 0 ? (
           <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">
             No pending markets. Click Run Pipeline to fetch fresh markets.

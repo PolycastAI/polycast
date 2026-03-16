@@ -161,3 +161,51 @@ CREATE TABLE if not exists daily_backup (
   tables_included TEXT[]
 );
 
+-- Helper function: atomically reset pending/held markets and insert new shortlist.
+create or replace function reset_and_insert_shortlist(new_markets jsonb)
+returns void
+language plpgsql
+as $$
+begin
+  -- Delete all held markers (text market_id, decoupled from markets FK)
+  delete from held_markets;
+
+  -- Delete all pending/held markets so we only have the new shortlist
+  delete from markets where status in ('pending', 'held');
+
+  -- Insert new pending markets from JSON payload
+  insert into markets (
+    polymarket_id,
+    title,
+    category,
+    resolution_date,
+    resolution_criteria,
+    market_url,
+    status,
+    current_price,
+    volume
+  )
+  select
+    (m->>'polymarket_id')::text,
+    m->>'title',
+    nullif(m->>'category', '')::text,
+    case
+      when m ? 'resolution_date' and m->>'resolution_date' is not null and m->>'resolution_date' <> ''
+      then (m->>'resolution_date')::timestamptz
+      else null
+    end,
+    nullif(m->>'resolution_criteria', '')::text,
+    nullif(m->>'market_url', '')::text,
+    'pending',
+    case
+      when m ? 'current_price' and m->>'current_price' <> '' then (m->>'current_price')::numeric
+      else null
+    end,
+    case
+      when m ? 'volume' and m->>'volume' <> '' then (m->>'volume')::numeric
+      else null
+    end
+  from jsonb_array_elements(new_markets) as m;
+end;
+$$;
+
