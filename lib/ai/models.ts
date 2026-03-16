@@ -9,11 +9,40 @@ export interface ModelCallResult extends ParsedForecastJson {
   responseTimeMs?: number;
 }
 
+const MOCK_ODDS = process.env.POLYCAST_MOCK_ODDS === "true";
+
+/** Deterministic but varied mock estimate per model (seed from prompt length + timestamp minute). */
+function mockEstimateFor(model: ModelName, _prompt: string): number {
+  const bases: Record<ModelName, number> = {
+    Claude: 42,
+    ChatGPT: 58,
+    Gemini: 51,
+    Grok: 47
+  };
+  const base = bases[model];
+  const seed = (typeof _prompt?.length === "number" ? _prompt.length : 0) + new Date().getMinutes();
+  const offset = ((seed * 17 + 31) % 31) - 15;
+  const estimate = Math.max(5, Math.min(95, base + offset));
+  return estimate;
+}
+
+function mockResultFor(model: ModelName, prompt: string): ModelCallResult {
+  const estimate = mockEstimateFor(model, prompt);
+  return {
+    estimate,
+    rawText: `[MOCK] ${model} estimate: ${estimate}% — no API call (POLYCAST_MOCK_ODDS=true).`,
+    inputTokens: 0,
+    outputTokens: 0,
+    responseTimeMs: 0
+  };
+}
+
 async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function callAnthropic(prompt: string): Promise<ModelCallResult> {
+  if (MOCK_ODDS) return mockResultFor("Claude", prompt);
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     throw new Error("ANTHROPIC_API_KEY is not set");
@@ -61,6 +90,7 @@ async function callAnthropic(prompt: string): Promise<ModelCallResult> {
 }
 
 async function callOpenAI(prompt: string): Promise<ModelCallResult> {
+  if (MOCK_ODDS) return mockResultFor("ChatGPT", prompt);
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     throw new Error("OPENAI_API_KEY is not set");
@@ -105,6 +135,7 @@ async function callOpenAI(prompt: string): Promise<ModelCallResult> {
 }
 
 async function callGemini(prompt: string): Promise<ModelCallResult> {
+  if (MOCK_ODDS) return mockResultFor("Gemini", prompt);
   const apiKey = process.env.GOOGLE_AI_API_KEY;
   if (!apiKey) {
     throw new Error("GOOGLE_AI_API_KEY is not set");
@@ -151,6 +182,7 @@ async function callGemini(prompt: string): Promise<ModelCallResult> {
 }
 
 async function callGrok(prompt: string): Promise<ModelCallResult> {
+  if (MOCK_ODDS) return mockResultFor("Grok", prompt);
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) {
     throw new Error("XAI_API_KEY is not set");
