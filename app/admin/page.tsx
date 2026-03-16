@@ -1,3 +1,4 @@
+import { unstable_noStore } from "next/cache";
 import { AdminDashboard } from "@/components/admin/AdminDashboard";
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { getTimeBucket } from "@/lib/markets/timeBuckets";
@@ -5,6 +6,7 @@ import { getTimeBucket } from "@/lib/markets/timeBuckets";
 export const dynamic = "force-dynamic";
 
 async function getAdminData() {
+  unstable_noStore();
   try {
     const [{ data: pendingRows, error: pendingError }, { count: pendingCount }] = await Promise.all([
       supabaseAdmin
@@ -20,12 +22,19 @@ async function getAdminData() {
 
     const now = new Date();
     const pending: any[] = [];
+    const maxCriteriaLength = 400;
     for (const row of pendingError ? [] : (pendingRows ?? [])) {
       try {
         const resolutionDate = row.resolution_date ? new Date(row.resolution_date) : null;
         const { daysToResolution, timeBucket } = getTimeBucket(now, resolutionDate);
+        const criteria = row.resolution_criteria ?? "";
+        const resolution_criteria =
+          criteria.length > maxCriteriaLength
+            ? criteria.slice(0, maxCriteriaLength) + "…"
+            : criteria;
         pending.push({
           ...row,
+          resolution_criteria,
           days_to_resolution: daysToResolution,
           time_bucket: timeBucket
         });
@@ -33,6 +42,7 @@ async function getAdminData() {
         console.error("Admin getAdminData: row failed", row?.id, rowErr);
         pending.push({
           ...row,
+          resolution_criteria: (row.resolution_criteria ?? "").slice(0, maxCriteriaLength),
           days_to_resolution: null,
           time_bucket: "extended"
         });
