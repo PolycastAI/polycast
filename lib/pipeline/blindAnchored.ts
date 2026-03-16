@@ -448,21 +448,54 @@ export async function runShortlistAndNotifyOnly() {
       newIds.push(id);
     }
     if (newIds.length > 0) {
-      const { data: oldPending } = await supabaseAdmin.from("markets").select("id").eq("status", "pending");
-      const idsToRemove = (oldPending ?? []).filter((r: any) => !newIds.includes(r.id)).map((r: any) => r.id);
+      const { data: oldPending } = await supabaseAdmin
+        .from("markets")
+        .select("id")
+        .eq("status", "pending");
+      const idsToRemove = (oldPending ?? [])
+        .filter((r: any) => !newIds.includes(r.id))
+        .map((r: any) => r.id);
       if (idsToRemove.length > 0) {
         await supabaseAdmin.from("markets").delete().in("id", idsToRemove);
       }
-      const { data: oldHeld } = await supabaseAdmin.from("markets").select("id").eq("status", "held");
+      const { data: oldHeld } = await supabaseAdmin
+        .from("markets")
+        .select("id")
+        .eq("status", "held");
       const heldIdsToRemove = (oldHeld ?? []).map((r: any) => r.id);
       if (heldIdsToRemove.length > 0) {
         await supabaseAdmin.from("markets").delete().in("id", heldIdsToRemove);
       }
     }
+
+    const { count: pendingCount } = await supabaseAdmin
+      .from("markets")
+      .select("*", { count: "exact", head: true })
+      .eq("status", "pending");
+
+    const selectionForTelegram = JSON.stringify(
+      shortlist.markets.map((m) => ({
+        id: m.polymarketId,
+        question: m.title,
+        crowd_price: m.crowd_price,
+        endDate: m.resolutionDate ? m.resolutionDate.toISOString() : null,
+        volume: m.volume
+      })),
+      null,
+      2
+    );
+
     await sendTelegramMessage(
       `Polycast shortlist ready.\n` +
-        `Candidates: ${shortlist.debug.strippedCount}. Pending: ${shortlist.markets.length}.\n\n` +
-        `Open /admin to approve markets, then run the "Run approved" job.`
+        `Candidates: ${shortlist.debug.strippedCount}. Shortlist: ${shortlist.markets.length}.\n` +
+        `DB pending count: ${pendingCount ?? 0}.\n\n` +
+        `Admin: https://polycast-blue.vercel.app/admin`
+    );
+
+    await sendTelegramMessage(
+      "Gemini selection JSON (post-dedup):\n```json\n" +
+        selectionForTelegram.slice(0, 3500) +
+        "\n```"
     );
     console.log("Shortlist + notify finished.");
     return { count: shortlist.markets.length };
