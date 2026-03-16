@@ -167,8 +167,8 @@ returns void
 language plpgsql
 as $$
 begin
-  -- Delete all held markers (text market_id, decoupled from markets FK)
-  delete from held_markets;
+  -- Delete all held markers (Supabase requires WHERE; "where true" matches all rows)
+  delete from held_markets where true;
 
   -- Delete all pending/held markets so we only have the new shortlist
   delete from markets where status in ('pending', 'held');
