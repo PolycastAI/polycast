@@ -335,7 +335,7 @@ export async function sendQueuedBlueskyPostById(
 ): Promise<string | null> {
   const { data: row, error } = await supabaseAdmin
     .from("social_posts")
-    .select("id, post_text, market_id")
+    .select("id, post_text, market_id, status")
     .eq("id", socialPostId)
     .maybeSingle();
 
