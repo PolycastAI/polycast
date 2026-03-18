@@ -42,18 +42,23 @@ interface Props {
   held: HeldRow[];
   approved: ApprovedMarket[];
   blueskyPendingPosts?: any[];
+  blueskySentPosts?: any[];
 }
 
 export function AdminDashboard({
   pending: initialPending,
   pendingCount,
   approved: initialApproved,
-  blueskyPendingPosts: initialBlueskyPendingPosts = []
+  blueskyPendingPosts: initialBlueskyPendingPosts = [],
+  blueskySentPosts: initialBlueskySentPosts = []
 }: Props) {
   const [pending, setPending] = useState(initialPending);
   const [approved, setApproved] = useState(initialApproved);
   const [blueskyPendingPosts, setBlueskyPendingPosts] = useState(
     initialBlueskyPendingPosts
+  );
+  const [blueskySentPosts, setBlueskySentPosts] = useState(
+    initialBlueskySentPosts
   );
   const [pipelineBusy, setPipelineBusy] = useState(false);
   const [pipelineMessage, setPipelineMessage] = useState<string | null>(null);
@@ -70,6 +75,10 @@ export function AdminDashboard({
   useEffect(() => {
     setBlueskyPendingPosts(initialBlueskyPendingPosts);
   }, [initialBlueskyPendingPosts]);
+
+  useEffect(() => {
+    setBlueskySentPosts(initialBlueskySentPosts);
+  }, [initialBlueskySentPosts]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -153,6 +162,54 @@ export function AdminDashboard({
       const msg = err instanceof Error ? err.message : String(err);
       setPipelineMessage(`Error: ${msg}`);
       alert(`Regenerate failed: ${msg}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function sendAllBlueskyPendingPosts() {
+    setPipelineBusy(true);
+    setPipelineMessage(null);
+    try {
+      const res = await fetch("/api/admin/social/bluesky/send", {
+        method: "POST"
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPipelineMessage(
+          `Send failed: ${(body as { error?: string }).error ?? res.statusText}`
+        );
+        return;
+      }
+      const count = (body as { count?: number }).count ?? 0;
+      setPipelineMessage(`Sent ${count} pending Bluesky posts. Refreshing…`);
+      setTimeout(() => window.location.reload(), 1500);
+    } catch (e) {
+      setPipelineMessage(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setPipelineBusy(false);
+    }
+  }
+
+  async function sendSingleBlueskyPost(postId: string) {
+    setBusyId(postId);
+    setPipelineMessage(null);
+    try {
+      const res = await fetch(`/api/admin/social/bluesky/send/${postId}`, {
+        method: "POST"
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          (body as { error?: string }).error ?? res.statusText ?? "send failed"
+        );
+      }
+      setPipelineMessage("Sent. Refreshing…");
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPipelineMessage(`Error: ${msg}`);
+      alert(`Send failed: ${msg}`);
     } finally {
       setBusyId(null);
     }
@@ -423,8 +480,18 @@ export function AdminDashboard({
 
       <section>
         <h2 className="mb-3 mt-8 text-lg font-semibold text-slate-100">
-          Bluesky posts to send ({blueskyPendingPosts.length})
+          Bluesky pending posts ({blueskyPendingPosts.length})
         </h2>
+        <div className="mb-3 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={sendAllBlueskyPendingPosts}
+            disabled={pipelineBusy || blueskyPendingPosts.length === 0}
+            className="rounded-full border border-emerald-700 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-emerald-200 shadow hover:bg-slate-950 disabled:opacity-60"
+          >
+            Send All Pending
+          </button>
+        </div>
         {blueskyPendingPosts.length === 0 ? (
           <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">
             No Bluesky posts awaiting posting (all are marked `posted`).
@@ -438,7 +505,7 @@ export function AdminDashboard({
               >
                 <div className="space-y-2">
                   <h3 className="text-base font-semibold text-slate-100">
-                    {p.title}
+                    {p.title ?? p.post_type ?? "Social post"}
                   </h3>
                   <p className="text-xs text-slate-400">
                     <span className="font-medium text-slate-300">Type:</span>{" "}
@@ -488,6 +555,62 @@ export function AdminDashboard({
                     View on Polymarket ↗
                   </a>
                 )}
+
+                <button
+                  onClick={() => sendSingleBlueskyPost(p.id)}
+                  disabled={busyId === p.id}
+                  className="mt-3 rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 shadow hover:bg-emerald-400 disabled:opacity-60"
+                >
+                  Send
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section>
+        <h2 className="mb-3 mt-10 text-lg font-semibold text-slate-100">
+          Bluesky sent posts ({blueskySentPosts.length})
+        </h2>
+        {blueskySentPosts.length === 0 ? (
+          <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">
+            No Bluesky posts have been sent yet.
+          </p>
+        ) : (
+          <div className="grid gap-4 md:grid-cols-2">
+            {blueskySentPosts.map((p: any) => (
+              <div
+                key={p.id}
+                className="flex flex-col justify-between rounded-xl border border-slate-800 bg-slate-950/60 p-4"
+              >
+                <div className="space-y-2">
+                  <h3 className="text-base font-semibold text-slate-100">
+                    {p.title ?? p.post_type ?? "Social post"}
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    <span className="font-medium text-slate-300">Type:</span>{" "}
+                    {p.post_type ?? "—"} · <span className="font-medium text-slate-300">Posted:</span>{" "}
+                    {p.posted_at ? new Date(p.posted_at).toLocaleString() : "—"}
+                  </p>
+                  {p.platform_post_id && (
+                    <p className="text-xs text-slate-400">
+                      <span className="font-medium text-slate-300">URI:</span>{" "}
+                      <span className="font-mono">
+                        {String(p.platform_post_id).slice(0, 32)}
+                        …
+                      </span>
+                    </p>
+                  )}
+                </div>
+                <div className="mt-3 rounded border border-slate-700 bg-slate-900/50 p-2">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                    Post text
+                  </p>
+                  <pre className="mt-1 max-h-36 overflow-y-auto whitespace-pre-wrap text-xs text-slate-200">
+                    {p.post_text}
+                  </pre>
+                </div>
               </div>
             ))}
           </div>

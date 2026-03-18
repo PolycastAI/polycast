@@ -265,60 +265,52 @@ export async function runBlindAndAnchoredForMarketWithId(
       error: "insufficient_signals",
       severity: "info"
     });
-  } else {
-    await supabaseAdmin
-      .from("markets")
-      // Keep in the admin "Approved" snapshot after generating odds.
-      // (The admin panel's snapshot currently queries `status = 'approved'`.)
-      .update({ status: "active" })
-      .eq("id", marketId);
+  }
 
-    // Post to Bluesky using blind estimates only (anchored is for internal analysis).
-    try {
-      const polymarketProbPercent = Math.round(m.probability * 100);
-      const socialTitle =
-        options?.socialTitle != null && options.socialTitle !== ""
-          ? options.socialTitle
-          : (m.title?.length ?? 0) > 60
-            ? `${m.title.slice(0, 57)}…`
-            : m.title;
-
-      const predictionsForPost: PredictionSummaryForPost[] = results.map(
-        (r) => ({
-          model: r.model,
-          estimate: r.estimate,
-          signal: r.signal
-        })
-      );
-
-      const uri = await postPredictionToBluesky({
-        marketId,
-        socialTitle,
-        polymarketProbPercent,
-        resolutionDate: m.resolutionDate
-          ? m.resolutionDate.toISOString()
-          : null,
-        predictions: predictionsForPost
-      });
-
-      if (uri) {
-        await supabaseAdmin
-          .from("markets")
-          .update({ post_id_bluesky: uri })
-          .eq("id", marketId);
-      }
-    } catch (blueskyError) {
-      console.error(
-        `Failed to post Bluesky prediction for market ${marketId}:`,
-        blueskyError
-      );
-      await logErrorToDb({
-        job: "blind_anchored_pipeline",
-        marketId,
-        error: blueskyError,
-        severity: "warning"
-      });
+  // Queue Bluesky "prediction" post for human review (never gated by min-signal rule).
+  // We always want an audit log entry in `social_posts` so the admin UI can display pending/sent.
+  try {
+    if (betCount >= 2) {
+      await supabaseAdmin
+        .from("markets")
+        .update({ status: "active" })
+        .eq("id", marketId);
     }
+
+    const polymarketProbPercent = Math.round(m.probability * 100);
+    const socialTitle =
+      options?.socialTitle != null && options.socialTitle !== ""
+        ? options.socialTitle
+        : (m.title?.length ?? 0) > 60
+          ? `${m.title.slice(0, 57)}…`
+          : m.title;
+
+    const predictionsForPost: PredictionSummaryForPost[] = results.map((r) => ({
+      model: r.model,
+      estimate: r.estimate,
+      signal: r.signal
+    }));
+
+    await postPredictionToBluesky({
+      marketId,
+      socialTitle,
+      polymarketProbPercent,
+      resolutionDate: m.resolutionDate
+        ? m.resolutionDate.toISOString()
+        : null,
+      predictions: predictionsForPost
+    });
+  } catch (blueskyError) {
+    console.error(
+      `Failed to queue Bluesky prediction for market ${marketId}:`,
+      blueskyError
+    );
+    await logErrorToDb({
+      job: "blind_anchored_pipeline",
+      marketId,
+      error: blueskyError,
+      severity: "error"
+    });
   }
 }
 

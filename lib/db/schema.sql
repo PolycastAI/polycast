@@ -139,7 +139,7 @@ CREATE TABLE if not exists social_posts (
   post_type TEXT NOT NULL, -- e.g. 'prediction', 'resolution', 're_run_update', 'weekly_leaderboard'
   market_id UUID REFERENCES markets(id),
   post_text TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued', -- queued | posted | failed
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | posted | failed
   platform_post_id TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   posted_at TIMESTAMPTZ,
