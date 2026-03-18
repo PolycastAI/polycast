@@ -557,7 +557,7 @@ export async function runPromptsForApprovedMarkets() {
       resolutionDate,
       daysToResolution,
       timeBucket,
-      marketUrl: market.market_url ?? `https://polymarket.com/market/${market.polymarket_id}`
+      marketUrl: market.market_url ?? null
     };
     try {
       await runBlindAndAnchoredForMarketWithId(market.id, m, {
@@ -613,7 +613,7 @@ export async function runPromptsForMarketId(marketId: string): Promise<void> {
     resolutionDate,
     daysToResolution,
     timeBucket,
-    marketUrl: (market as any).market_url ?? `https://polymarket.com/market/${(market as any).polymarket_id}`
+    marketUrl: (market as any).market_url ?? null
   };
   await runBlindAndAnchoredForMarketWithId(marketId, m, {
     socialTitle: (market as any).social_title

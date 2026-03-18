@@ -9,7 +9,9 @@ export interface ModelCallResult extends ParsedForecastJson {
   responseTimeMs?: number;
 }
 
-const MOCK_ODDS = process.env.POLYCAST_MOCK_ODDS === "true";
+// Default to mock so pipeline testing never burns real API credits.
+// Set `POLYCAST_MOCK_ODDS=false` to enable real model calls.
+const MOCK_ODDS = process.env.POLYCAST_MOCK_ODDS !== "false";
 
 /** Deterministic but varied mock estimate per model (seed from prompt length + timestamp minute). */
 function mockEstimateFor(model: ModelName, _prompt: string): number {

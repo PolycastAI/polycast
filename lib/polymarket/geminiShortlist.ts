@@ -29,6 +29,7 @@ export interface StrippedMarket {
   endDate: string;
   volume: number;
   yesPrice: number;
+  slug?: string | null;
 }
 
 function parseOutcomes(raw: string | string[] | null | undefined): string[] {
@@ -87,14 +88,21 @@ function stripMarkets(raw: GammaMarket[]): StrippedMarket[] {
     if (yesPrice == null || yesPrice < 0.1 || yesPrice > 0.9) continue;
     const volume = Number(m.volume ?? 0);
     if (volume < 5000) continue;
-    const endDate = m.endDate ?? (m as { endDateIso?: string }).endDateIso ?? null;
+    // Prefer market's own resolution fields; fall back to parent event's endDate if present.
+    const endDate =
+      m.endDate ??
+      (m as { endDateIso?: string }).endDateIso ??
+      m.gameStartTime ??
+      m.events?.[0]?.endDate ??
+      null;
     if (!endDate) continue;
     out.push({
       id: m.id,
       question: m.question ?? "Untitled",
       endDate: String(endDate),
       volume,
-      yesPrice
+      yesPrice,
+      slug: m.slug ?? null
     });
   }
   return out;
@@ -159,7 +167,15 @@ async function callGeminiForSelection(
   const apiKey = process.env.GOOGLE_AI_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_AI_API_KEY is not set");
 
-  const userContent = JSON.stringify(strippedList);
+  // Send only the fields requested in the system prompt.
+  const safeList = strippedList.map((s) => ({
+    id: s.id,
+    question: s.question,
+    endDate: s.endDate,
+    volume: s.volume,
+    yesPrice: s.yesPrice
+  }));
+  const userContent = JSON.stringify(safeList);
   const instruction =
     wantCount >= strippedList.length
       ? `Select all ${strippedList.length} markets from this list. Return only a JSON array.\n\n`
@@ -229,6 +245,7 @@ export async function buildGeminiShortlist(
 
   const raw = await fetchRawMarkets();
   const stripped = stripMarkets(raw);
+  const slugById = new Map<string, string | null>(stripped.map((s) => [s.id, s.slug ?? null]));
   const pool = stripped.filter((s) => !existingSet.has(s.id) && !excludedSet.has(s.id));
 
   let selected: { id: string; question: string; crowd_price: number; endDate: string; volume: number }[] = [];
@@ -264,10 +281,9 @@ export async function buildGeminiShortlist(
     const resolutionDate = sel.endDate ? new Date(sel.endDate) : null;
     if (!resolutionDate || isNaN(resolutionDate.getTime())) continue;
     const { daysToResolution, timeBucket } = getTimeBucket(now, resolutionDate);
-    const slug = full ? (full as { slug?: string }).slug : null;
-    const marketUrl = slug
-      ? `https://polymarket.com/event/${slug}`
-      : `https://polymarket.com/market/${sel.id}`;
+    // Polymarket URLs are event-slug based.
+    const slug = (full as { slug?: string | null } | null)?.slug ?? slugById.get(sel.id) ?? null;
+    const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
     const description = full?.description ?? null;
     const category = full?.category ?? null;
 

@@ -184,9 +184,8 @@ export async function buildSlotShortlist(
   const toShortlist = (item: (typeof filtered)[0]): ShortlistMarket => {
     const { daysToResolution, timeBucket } = getTimeBucket(now, item.resolutionDate);
     const slug = (item.m as { slug?: string }).slug;
-    const marketUrl = slug
-      ? `https://polymarket.com/event/${slug}`
-      : `https://polymarket.com/market/${item.m.id}`;
+    // Polymarket market URLs are event-slug based.
+    const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
     return {
       polymarketId: item.m.id,
       title: item.m.question ?? "Untitled",

@@ -166,7 +166,22 @@ create or replace function reset_and_insert_shortlist(new_markets jsonb)
 returns void
 language plpgsql
 as $$
+declare
+  cleared_market_ids uuid[];
 begin
+  -- Capture markets we're about to clear (pending + held), so we can delete
+  -- dependent rows first and avoid FK failures.
+  select array_agg(id) into cleared_market_ids
+  from markets
+  where status in ('pending', 'held');
+
+  if cleared_market_ids is not null then
+    delete from predictions where market_id = ANY(cleared_market_ids);
+    delete from market_prices where market_id = ANY(cleared_market_ids);
+    delete from re_run_schedule where market_id = ANY(cleared_market_ids);
+    delete from sensitivity_tests where market_id = ANY(cleared_market_ids);
+  end if;
+
   -- Delete all held markers (Supabase requires WHERE; "where true" matches all rows)
   delete from held_markets where true;
 
