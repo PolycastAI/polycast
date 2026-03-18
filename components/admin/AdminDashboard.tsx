@@ -289,7 +289,7 @@ export function AdminDashboard({
 
       <section>
         <h2 className="mb-3 mt-8 text-lg font-semibold text-slate-100">
-          Approved markets ({approved.length})
+          Approved/Active markets ({approved.length})
         </h2>
         {approved.length === 0 ? (
           <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">

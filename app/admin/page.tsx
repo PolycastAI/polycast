@@ -26,7 +26,7 @@ async function getAdminData() {
       .select(
         "id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
       )
-      .eq("status", "approved")
+      .in("status", ["approved", "active"])
       .order("created_at", { ascending: false });
 
     const now = new Date();
