@@ -9,6 +9,17 @@ export interface TokenHealthResult {
 }
 
 export function tokenHealthCheck(): TokenHealthResult {
+  // If we run in mock-odds mode, we should not require paid API keys.
+  // (Odds generation functions will short-circuit to deterministic mocks.)
+  const mockOdds = process.env.POLYCAST_MOCK_ODDS !== "false";
+  if (mockOdds) {
+    return {
+      ok: true,
+      missing: [],
+      message: "Mock odds enabled; skipping paid token checks."
+    };
+  }
+
   const required = [
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
