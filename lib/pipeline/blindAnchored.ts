@@ -268,6 +268,8 @@ export async function runBlindAndAnchoredForMarketWithId(
   } else {
     await supabaseAdmin
       .from("markets")
+      // Keep in the admin "Approved" snapshot after generating odds.
+      // (The admin panel's snapshot currently queries `status = 'approved'`.)
       .update({ status: "active" })
       .eq("id", marketId);
 
