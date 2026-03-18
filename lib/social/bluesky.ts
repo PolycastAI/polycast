@@ -1,7 +1,67 @@
 /* eslint-disable no-console */
 
+import { supabaseAdmin } from "@/lib/supabase/server";
+
 const BLUESKY_HANDLE = process.env.BLUESKY_HANDLE;
 const BLUESKY_APP_PASSWORD = process.env.BLUESKY_APP_PASSWORD;
+
+async function createSocialPostLog(args: {
+  platform: string;
+  postType: string;
+  marketId: string | null;
+  postText: string;
+  status?: string;
+}): Promise<string | null> {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("social_posts")
+      .insert({
+        platform: args.platform,
+        post_type: args.postType,
+        market_id: args.marketId,
+        post_text: args.postText,
+        status: args.status ?? "queued",
+        platform_post_id: null,
+        error_message: null
+      })
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("Failed to create social_posts log:", error);
+      return null;
+    }
+    return data?.id ?? null;
+  } catch (err) {
+    console.error("social_posts insert threw:", err);
+    return null;
+  }
+}
+
+async function updateSocialPostLog(
+  logId: string | null,
+  updates: {
+    status: string;
+    platformPostId?: string | null;
+    errorMessage?: string | null;
+    postedAt?: string | null;
+  }
+) {
+  if (!logId) return;
+  try {
+    await supabaseAdmin
+      .from("social_posts")
+      .update({
+        status: updates.status,
+        platform_post_id: updates.platformPostId ?? null,
+        error_message: updates.errorMessage ?? null,
+        posted_at: updates.postedAt
+      })
+      .eq("id", logId);
+  } catch (err) {
+    console.error("social_posts update threw:", err);
+  }
+}
 
 interface BlueskySession {
   accessJwt: string;
@@ -52,7 +112,6 @@ export async function postPredictionToBluesky(args: {
   predictions: PredictionSummaryForPost[];
 }): Promise<string | null> {
   const session = await createSession();
-  if (!session) return null;
 
   const { marketId, socialTitle, polymarketProbPercent, resolutionDate } = args;
 
@@ -83,6 +142,23 @@ export async function postPredictionToBluesky(args: {
 
   const text = lines.join("\n");
 
+  const logId = await createSocialPostLog({
+    platform: "bluesky",
+    postType: "prediction",
+    marketId,
+    postText: text,
+    status: "queued"
+  });
+
+  if (!session) {
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: "Bluesky env vars not set (createSession returned null)",
+      postedAt: null
+    });
+    return null;
+  }
+
   const record = {
     $type: "app.bsky.feed.post",
     text,
@@ -107,11 +183,22 @@ export async function postPredictionToBluesky(args: {
 
   if (!res.ok) {
     console.error("Bluesky post failed:", res.status, res.statusText);
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: `Bluesky post failed: ${res.status} ${res.statusText}`,
+      postedAt: null
+    });
     return null;
   }
 
   const json = await res.json();
   const uri: string | undefined = json?.uri;
+  await updateSocialPostLog(logId, {
+    status: uri ? "posted" : "failed",
+    platformPostId: uri ?? null,
+    errorMessage: null,
+    postedAt: uri ? new Date().toISOString() : null
+  });
   return uri ?? null;
 }
 
@@ -122,6 +209,7 @@ export interface ResolutionModelPnl {
 }
 
 export async function postResolutionToBluesky(args: {
+  marketId: string;
   socialTitle: string;
   outcome: boolean; // true = YES
   modelPnls: ResolutionModelPnl[];
@@ -129,7 +217,6 @@ export async function postResolutionToBluesky(args: {
   includeCumulative?: boolean;
 }): Promise<string | null> {
   const session = await createSession();
-  if (!session) return null;
 
   const lines: string[] = [];
   lines.push(`✅ Resolved: ${args.outcome ? "YES" : "NO"}`);
@@ -166,6 +253,23 @@ export async function postResolutionToBluesky(args: {
     createdAt: new Date().toISOString()
   };
 
+  const logId = await createSocialPostLog({
+    platform: "bluesky",
+    postType: "resolution",
+    marketId: args.marketId,
+    postText: record.text,
+    status: "queued"
+  });
+
+  if (!session) {
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: "Bluesky env vars not set (createSession returned null)",
+      postedAt: null
+    });
+    return null;
+  }
+
   const res = await fetch(
     "https://bsky.social/xrpc/com.atproto.repo.createRecord",
     {
@@ -183,10 +287,22 @@ export async function postResolutionToBluesky(args: {
   );
   if (!res.ok) {
     console.error("Bluesky resolution post failed:", res.status, res.statusText);
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: `Bluesky resolution post failed: ${res.status} ${res.statusText}`,
+      postedAt: null
+    });
     return null;
   }
   const json = await res.json();
-  return json?.uri ?? null;
+  const uri: string | undefined = json?.uri;
+  await updateSocialPostLog(logId, {
+    status: uri ? "posted" : "failed",
+    platformPostId: uri ?? null,
+    errorMessage: null,
+    postedAt: uri ? new Date().toISOString() : null
+  });
+  return uri ?? null;
 }
 
 export interface ReRunChange {
@@ -197,12 +313,12 @@ export interface ReRunChange {
 }
 
 export async function postReRunUpdateToBluesky(args: {
+  marketId: string;
   socialTitle: string;
   marketUrl: string;
   changes: ReRunChange[];
 }): Promise<string | null> {
   const session = await createSession();
-  if (!session) return null;
 
   const lines: string[] = [];
   lines.push("🔄 Update (re-run): " + args.socialTitle);
@@ -221,6 +337,23 @@ export async function postReRunUpdateToBluesky(args: {
     createdAt: new Date().toISOString()
   };
 
+  const logId = await createSocialPostLog({
+    platform: "bluesky",
+    postType: "re_run_update",
+    marketId: args.marketId,
+    postText: record.text,
+    status: "queued"
+  });
+
+  if (!session) {
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: "Bluesky env vars not set (createSession returned null)",
+      postedAt: null
+    });
+    return null;
+  }
+
   const res = await fetch(
     "https://bsky.social/xrpc/com.atproto.repo.createRecord",
     {
@@ -236,9 +369,23 @@ export async function postReRunUpdateToBluesky(args: {
       })
     }
   );
-  if (!res.ok) return null;
+  if (!res.ok) {
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: `Bluesky re-run update failed: ${res.status} ${res.statusText}`,
+      postedAt: null
+    });
+    return null;
+  }
   const json = await res.json();
-  return json?.uri ?? null;
+  const uri: string | undefined = json?.uri;
+  await updateSocialPostLog(logId, {
+    status: uri ? "posted" : "failed",
+    platformPostId: uri ?? null,
+    errorMessage: null,
+    postedAt: uri ? new Date().toISOString() : null
+  });
+  return uri ?? null;
 }
 
 export interface LeaderboardRowForPost {
@@ -252,7 +399,6 @@ export async function postWeeklyLeaderboardToBluesky(
   rows: LeaderboardRowForPost[]
 ): Promise<string | null> {
   const session = await createSession();
-  if (!session) return null;
 
   const lines: string[] = [];
   lines.push("📊 Polycast weekly leaderboard (all-time)");
@@ -273,6 +419,23 @@ export async function postWeeklyLeaderboardToBluesky(
     createdAt: new Date().toISOString()
   };
 
+  const logId = await createSocialPostLog({
+    platform: "bluesky",
+    postType: "weekly_leaderboard",
+    marketId: null,
+    postText: record.text,
+    status: "queued"
+  });
+
+  if (!session) {
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: "Bluesky env vars not set (createSession returned null)",
+      postedAt: null
+    });
+    return null;
+  }
+
   const res = await fetch(
     "https://bsky.social/xrpc/com.atproto.repo.createRecord",
     {
@@ -288,8 +451,22 @@ export async function postWeeklyLeaderboardToBluesky(
       })
     }
   );
-  if (!res.ok) return null;
+  if (!res.ok) {
+    await updateSocialPostLog(logId, {
+      status: "failed",
+      errorMessage: `Bluesky weekly leaderboard failed: ${res.status} ${res.statusText}`,
+      postedAt: null
+    });
+    return null;
+  }
   const json = await res.json();
-  return json?.uri ?? null;
+  const uri: string | undefined = json?.uri;
+  await updateSocialPostLog(logId, {
+    status: uri ? "posted" : "failed",
+    platformPostId: uri ?? null,
+    errorMessage: null,
+    postedAt: uri ? new Date().toISOString() : null
+  });
+  return uri ?? null;
 }
 

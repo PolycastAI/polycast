@@ -132,6 +132,20 @@ CREATE TABLE if not exists error_log (
   resolved BOOLEAN DEFAULT FALSE
 );
 
+-- 10. social_posts (audit log for all Bluesky/X posting attempts)
+CREATE TABLE if not exists social_posts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  platform TEXT NOT NULL, -- e.g. 'bluesky'
+  post_type TEXT NOT NULL, -- e.g. 'prediction', 'resolution', 're_run_update', 'weekly_leaderboard'
+  market_id UUID REFERENCES markets(id),
+  post_text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued', -- queued | posted | failed
+  platform_post_id TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  posted_at TIMESTAMPTZ,
+  error_message TEXT
+);
+
 -- 10. re_run_schedule
 CREATE TABLE if not exists re_run_schedule (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

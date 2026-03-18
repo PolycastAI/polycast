@@ -164,6 +164,7 @@ export async function runReRunJob() {
 
     if (changes.length > 0) {
       await postReRunUpdateToBluesky({
+        marketId: market.id,
         socialTitle:
           (market.social_title || market.title) ?? "Market",
         marketUrl: `https://polycast.ai/market/${market.id}`,

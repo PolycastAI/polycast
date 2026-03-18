@@ -211,6 +211,7 @@ export async function runResolutionChecker() {
       item.includeCumulative = includeCumulative;
     }
     await postResolutionToBluesky({
+      marketId: item.marketId,
       socialTitle: item.socialTitle,
       outcome: item.outcome,
       modelPnls: item.modelPnls,
