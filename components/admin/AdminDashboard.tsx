@@ -41,15 +41,20 @@ interface Props {
   pendingCount: number;
   held: HeldRow[];
   approved: ApprovedMarket[];
+  blueskyPendingPosts?: any[];
 }
 
 export function AdminDashboard({
   pending: initialPending,
   pendingCount,
-  approved: initialApproved
+  approved: initialApproved,
+  blueskyPendingPosts: initialBlueskyPendingPosts = []
 }: Props) {
   const [pending, setPending] = useState(initialPending);
   const [approved, setApproved] = useState(initialApproved);
+  const [blueskyPendingPosts, setBlueskyPendingPosts] = useState(
+    initialBlueskyPendingPosts
+  );
   const [pipelineBusy, setPipelineBusy] = useState(false);
   const [pipelineMessage, setPipelineMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -61,6 +66,10 @@ export function AdminDashboard({
   useEffect(() => {
     setApproved(initialApproved);
   }, [initialApproved]);
+
+  useEffect(() => {
+    setBlueskyPendingPosts(initialBlueskyPendingPosts);
+  }, [initialBlueskyPendingPosts]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -406,6 +415,79 @@ export function AdminDashboard({
                     Reject (7 days)
                   </button>
                 </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section>
+        <h2 className="mb-3 mt-8 text-lg font-semibold text-slate-100">
+          Bluesky posts to send ({blueskyPendingPosts.length})
+        </h2>
+        {blueskyPendingPosts.length === 0 ? (
+          <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">
+            No Bluesky posts awaiting posting (all are marked `posted`).
+          </p>
+        ) : (
+          <div className="grid gap-4 md:grid-cols-2">
+            {blueskyPendingPosts.map((p: any) => (
+              <div
+                key={p.id}
+                className="flex flex-col justify-between rounded-xl border border-slate-800 bg-slate-950/60 p-4"
+              >
+                <div className="space-y-2">
+                  <h3 className="text-base font-semibold text-slate-100">
+                    {p.title}
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    <span className="font-medium text-slate-300">Type:</span>{" "}
+                    {p.post_type ?? "—"} · <span className="font-medium text-slate-300">Status:</span>{" "}
+                    <span className="font-mono">{p.status ?? "—"}</span>
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    <span className="font-medium text-slate-300">Created:</span>{" "}
+                    {p.created_at ? new Date(p.created_at).toLocaleString() : "—"}
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    <span className="font-medium text-slate-300">Posted:</span>{" "}
+                    {p.posted_at ? new Date(p.posted_at).toLocaleString() : "—"}
+                    {p.platform_post_id ? (
+                      <> · <span className="font-mono">{String(p.platform_post_id).slice(0, 32)}…</span></>
+                    ) : null}
+                  </p>
+
+                  <div className="rounded border border-slate-700 bg-slate-900/50 p-2">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                      Bluesky post text
+                    </p>
+                    <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap text-xs text-slate-200">
+                      {p.post_text}
+                    </pre>
+                  </div>
+
+                  {p.error_message && (
+                    <div className="rounded border border-red-900/40 bg-red-950/30 p-2">
+                      <p className="text-[11px] font-medium uppercase tracking-wide text-red-300">
+                        Error
+                      </p>
+                      <pre className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap text-xs text-red-200">
+                        {p.error_message}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+
+                {p.market_url && (
+                  <a
+                    href={p.market_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-3 inline-flex text-xs font-medium text-emerald-400 hover:text-emerald-300"
+                  >
+                    View on Polymarket ↗
+                  </a>
+                )}
               </div>
             ))}
           </div>

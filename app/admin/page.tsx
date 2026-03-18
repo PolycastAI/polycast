@@ -9,17 +9,20 @@ export const dynamic = "force-dynamic";
 async function getAdminData() {
   unstable_noStore();
   try {
-    const [{ data: pendingRows, error: pendingError }, { count: pendingCount }] = await Promise.all([
-      supabaseAdmin
-        .from("markets")
-        .select("id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at")
-        .eq("status", "pending")
-        .order("created_at", { ascending: false }),
-      supabaseAdmin
-        .from("markets")
-        .select("*", { count: "exact", head: true })
-        .eq("status", "pending")
-    ]);
+    const [{ data: pendingRows, error: pendingError }, { count: pendingCount }] =
+      await Promise.all([
+        supabaseAdmin
+          .from("markets")
+          .select(
+            "id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
+          )
+          .eq("status", "pending")
+          .order("created_at", { ascending: false }),
+        supabaseAdmin
+          .from("markets")
+          .select("*", { count: "exact", head: true })
+          .eq("status", "pending")
+      ]);
 
     const { data: approvedRows, error: approvedError } = await supabaseAdmin
       .from("markets")
@@ -146,20 +149,53 @@ async function getAdminData() {
 
     await Promise.all([...pending, ...approved].map(maybeFixMarketUrl));
 
+    // Bluesky posts audit log:
+    // We show anything that's not marked `posted` yet (queued/sending/failed).
+    const { data: blueskyPostsRows } =
+      await supabaseAdmin
+        .from("social_posts")
+        .select(
+          "id, post_type, status, post_text, created_at, posted_at, platform_post_id, error_message, market_id, markets(title, market_url, resolution_date, social_title)"
+        )
+        .eq("platform", "bluesky")
+        .neq("status", "posted")
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+    const blueskyPendingPosts = (blueskyPostsRows ?? []).map((p: any) => ({
+      id: p.id,
+      post_type: p.post_type,
+      status: p.status,
+      created_at: p.created_at,
+      posted_at: p.posted_at ?? null,
+      platform_post_id: p.platform_post_id ?? null,
+      error_message: p.error_message ?? null,
+      post_text: p.post_text,
+      marketId: p.market_id ?? null,
+      title:
+        p?.markets?.title ??
+        p?.markets?.social_title ??
+        p?.markets?.title ??
+        null,
+      market_url: p?.markets?.market_url ?? null,
+      resolution_date: p?.markets?.resolution_date ?? null
+    }));
+
     return {
       pending,
       pendingCount: pendingCount ?? pending.length,
       held: [],
-      approved
+      approved,
+      blueskyPendingPosts
     };
   } catch (e) {
     console.error("Admin getAdminData error:", e);
-    return { pending: [], pendingCount: 0, held: [], approved: [] };
+    return { pending: [], pendingCount: 0, held: [], approved: [], blueskyPendingPosts: [] };
   }
 }
 
 export default async function AdminPage() {
-  const { pending, pendingCount, held, approved } = await getAdminData();
+  const { pending, pendingCount, held, approved, blueskyPendingPosts } = await getAdminData();
 
   return (
     <main className="min-h-screen px-6 py-10 md:px-12 lg:px-24">
@@ -178,6 +214,7 @@ export default async function AdminPage() {
         pendingCount={pendingCount}
         held={held}
         approved={approved}
+        blueskyPendingPosts={blueskyPendingPosts}
       />
     </main>
   );
