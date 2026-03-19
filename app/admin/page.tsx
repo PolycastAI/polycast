@@ -237,7 +237,11 @@ async function getAdminData() {
 
       const gamma = await fetchMarketById(pmId);
       const slug = (gamma as any)?.slug ?? null;
-      m.market_url = slug ? `https://polymarket.com/event/${slug}` : null;
+      const safeSlug =
+        typeof slug === "string" && slug.trim().length > 0
+          ? encodeURIComponent(slug.trim())
+          : null;
+      m.market_url = safeSlug ? `https://polymarket.com/event/${safeSlug}` : null;
     };
 
     await Promise.all([...pending, ...approved, ...resolved].map(maybeFixMarketUrl));

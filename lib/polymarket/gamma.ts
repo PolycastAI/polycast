@@ -185,7 +185,11 @@ export async function buildSlotShortlist(
     const { daysToResolution, timeBucket } = getTimeBucket(now, item.resolutionDate);
     const slug = (item.m as { slug?: string }).slug;
     // Polymarket market URLs are event-slug based.
-    const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+    const safeSlug =
+      typeof slug === "string" && slug.trim().length > 0
+        ? encodeURIComponent(slug.trim())
+        : null;
+    const marketUrl = safeSlug ? `https://polymarket.com/event/${safeSlug}` : null;
     return {
       polymarketId: item.m.id,
       title: item.m.question ?? "Untitled",

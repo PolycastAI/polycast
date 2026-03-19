@@ -169,9 +169,16 @@ export async function runReRunJob() {
           (market.social_title || market.title) ?? "Market",
         marketUrl:
           market.market_url ??
-          (((gamma as any)?.slug
-            ? `https://polymarket.com/event/${(gamma as any).slug}`
-            : "https://polymarket.com/markets") as string),
+          ((() => {
+            const slug = (gamma as any)?.slug;
+            const safeSlug =
+              typeof slug === "string" && slug.trim().length > 0
+                ? encodeURIComponent(slug.trim())
+                : null;
+            return safeSlug
+              ? `https://polymarket.com/event/${safeSlug}`
+              : "https://polymarket.com/markets";
+          })() as string),
         changes
       });
     }

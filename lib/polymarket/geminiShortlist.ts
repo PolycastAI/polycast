@@ -283,7 +283,11 @@ export async function buildGeminiShortlist(
     const { daysToResolution, timeBucket } = getTimeBucket(now, resolutionDate);
     // Polymarket URLs are event-slug based.
     const slug = (full as { slug?: string | null } | null)?.slug ?? slugById.get(sel.id) ?? null;
-    const marketUrl = slug ? `https://polymarket.com/event/${slug}` : null;
+    const safeSlug =
+      typeof slug === "string" && slug.trim().length > 0
+        ? encodeURIComponent(slug.trim())
+        : null;
+    const marketUrl = safeSlug ? `https://polymarket.com/event/${safeSlug}` : null;
     const description = full?.description ?? null;
     const category = full?.category ?? null;
 

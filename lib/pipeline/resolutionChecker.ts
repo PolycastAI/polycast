@@ -149,9 +149,16 @@ export async function runResolutionChecker() {
       marketId: market.id,
       marketUrl:
         market.market_url ??
-        (((gamma as any)?.slug
-          ? `https://polymarket.com/event/${(gamma as any).slug}`
-          : "https://polymarket.com/markets") as string),
+        ((() => {
+          const slug = (gamma as any)?.slug;
+          const safeSlug =
+            typeof slug === "string" && slug.trim().length > 0
+              ? encodeURIComponent(slug.trim())
+              : null;
+          return safeSlug
+            ? `https://polymarket.com/event/${safeSlug}`
+            : "https://polymarket.com/markets";
+        })() as string),
       socialTitle:
         (market.social_title && market.social_title.length > 0
           ? market.social_title
