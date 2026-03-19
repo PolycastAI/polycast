@@ -30,6 +30,16 @@ interface ApprovedMarket extends AdminMarket {
   ai_odds_by_model: Record<string, ModelOddsSnapshot | undefined>;
 }
 
+interface ResolvedModelSnapshot extends ModelOddsSnapshot {
+  pnl: number | null;
+  outcome: boolean | null;
+}
+
+interface ResolvedMarket extends AdminMarket {
+  resolved_outcome: "YES" | "NO" | "Unknown";
+  ai_odds_by_model: Record<string, ResolvedModelSnapshot | undefined>;
+}
+
 interface HeldRow {
   id: string;
   market_id: string;
@@ -41,6 +51,7 @@ interface Props {
   pendingCount: number;
   held: HeldRow[];
   approved: ApprovedMarket[];
+  resolved: ResolvedMarket[];
   blueskyPendingPosts?: any[];
   blueskySentPosts?: any[];
 }
@@ -49,12 +60,19 @@ export function AdminDashboard({
   pending: initialPending,
   pendingCount,
   approved: initialApproved,
+  resolved: initialResolved,
   blueskyPendingPosts: initialBlueskyPendingPosts = [],
   blueskySentPosts: initialBlueskySentPosts = []
 }: Props) {
-  type AdminSection = "pending" | "approved" | "blueskyPending" | "blueskySent";
+  type AdminSection =
+    | "pending"
+    | "approved"
+    | "resolved"
+    | "blueskyPending"
+    | "blueskySent";
   const [pending, setPending] = useState(initialPending);
   const [approved, setApproved] = useState(initialApproved);
+  const [resolved, setResolved] = useState(initialResolved);
   const [blueskyPendingPosts, setBlueskyPendingPosts] = useState(
     initialBlueskyPendingPosts
   );
@@ -73,6 +91,10 @@ export function AdminDashboard({
   useEffect(() => {
     setApproved(initialApproved);
   }, [initialApproved]);
+
+  useEffect(() => {
+    setResolved(initialResolved);
+  }, [initialResolved]);
 
   useEffect(() => {
     setBlueskyPendingPosts(initialBlueskyPendingPosts);
@@ -319,6 +341,17 @@ export function AdminDashboard({
           </button>
           <button
             type="button"
+            onClick={() => setActiveSection("resolved")}
+            className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
+              activeSection === "resolved"
+                ? "bg-emerald-500 text-slate-950"
+                : "border border-slate-700 text-slate-200 hover:border-slate-500"
+            }`}
+          >
+            Resolved ({resolved.length})
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveSection("blueskySent")}
             className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
               activeSection === "blueskySent"
@@ -554,6 +587,138 @@ export function AdminDashboard({
                   >
                     Reject (7 days)
                   </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+      )}
+
+      {activeSection === "resolved" && (
+      <section>
+        <h2 className="mb-3 mt-8 text-lg font-semibold text-slate-100">
+          Resolved markets ({resolved.length})
+        </h2>
+        {resolved.length === 0 ? (
+          <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">
+            No resolved markets yet.
+          </p>
+        ) : (
+          <div className="grid gap-4 md:grid-cols-2">
+            {resolved.map((m) => (
+              <div
+                key={m.id}
+                className="flex flex-col justify-between rounded-xl border border-slate-800 bg-slate-950/60 p-4"
+              >
+                <div className="space-y-2">
+                  <div className="rounded border border-slate-700 bg-slate-900/50 p-2">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                      Real-world result
+                    </p>
+                    <p
+                      className={`mt-1 text-sm font-semibold ${
+                        m.resolved_outcome === "YES"
+                          ? "text-emerald-300"
+                          : m.resolved_outcome === "NO"
+                            ? "text-red-300"
+                            : "text-slate-300"
+                      }`}
+                    >
+                      {m.resolved_outcome}
+                    </p>
+                  </div>
+
+                  <div className="rounded border border-slate-700 bg-slate-900/50 p-2">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                      Model P&L snapshot
+                    </p>
+                    <div className="mt-2 space-y-1">
+                      {(["Claude", "ChatGPT", "Gemini", "Grok"] as const).map((model) => {
+                        const o = m.ai_odds_by_model?.[model];
+                        const estimate =
+                          o?.anchored_estimate != null
+                            ? o.anchored_estimate
+                            : o?.blind_estimate;
+                        const pnl = o?.pnl;
+                        return (
+                          <p key={model} className="text-xs text-slate-300">
+                            <span className="font-medium text-slate-200">{model}:</span>{" "}
+                            {estimate != null ? `${estimate}%` : "—"}
+                            {o?.signal ? ` (${o.signal})` : ""}
+                            {" · "}
+                            <span
+                              className={
+                                pnl == null
+                                  ? "text-slate-300"
+                                  : Number(pnl) >= 0
+                                    ? "text-emerald-300"
+                                    : "text-red-300"
+                              }
+                            >
+                              {pnl == null ? "PASS" : `${Number(pnl) >= 0 ? "+" : ""}$${Math.round(Number(pnl))}`}
+                            </span>
+                          </p>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <h3 className="text-base font-semibold text-slate-100">{m.title}</h3>
+                  <p className="text-xs text-slate-400">
+                    <span className="font-medium text-slate-300">Category:</span>{" "}
+                    {m.category ?? "Uncategorized"}
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    <span className="font-medium text-slate-300">Crowd price:</span>{" "}
+                    {m.current_price != null
+                      ? `${Math.round(Number(m.current_price) * 100)}%`
+                      : "—"}
+                    {m.volume != null && (
+                      <>
+                        {" "}
+                        · <span className="font-medium text-slate-300">Volume:</span> $
+                        {Number(m.volume).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                      </>
+                    )}
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    <span className="font-medium text-slate-300">Resolution date:</span>{" "}
+                    {m.resolution_date
+                      ? new Date(m.resolution_date).toLocaleString(undefined, {
+                          dateStyle: "medium",
+                          timeStyle: "short"
+                        })
+                      : "TBD"}
+                    {m.time_bucket && (
+                      <>
+                        {" "}
+                        · <span className="font-mono text-slate-300">{m.time_bucket}</span>
+                      </>
+                    )}
+                  </p>
+
+                  {m.resolution_criteria && (
+                    <div className="rounded border border-slate-700 bg-slate-900/50 p-2">
+                      <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                        Resolution criteria
+                      </p>
+                      <p className="mt-1 max-h-24 overflow-y-auto text-xs text-slate-300 whitespace-pre-wrap">
+                        {m.resolution_criteria}
+                      </p>
+                    </div>
+                  )}
+
+                  {m.market_url && (
+                    <a
+                      href={m.market_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center text-xs font-medium text-emerald-400 hover:text-emerald-300"
+                    >
+                      View on Polymarket ↗
+                    </a>
+                  )}
                 </div>
               </div>
             ))}
