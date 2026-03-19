@@ -293,6 +293,7 @@ export async function runBlindAndAnchoredForMarketWithId(
 
     await postPredictionToBluesky({
       marketId,
+      marketUrl: m.marketUrl ?? null,
       socialTitle,
       polymarketProbPercent,
       resolutionDate: m.resolutionDate

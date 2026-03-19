@@ -27,7 +27,7 @@ export async function runResolutionChecker() {
 
   const { data: markets, error: marketError } = await supabaseAdmin
     .from("markets")
-    .select("id, polymarket_id, title, social_title, post_id_bluesky")
+    .select("id, polymarket_id, title, social_title, post_id_bluesky, market_url")
     .in("id", marketIds);
 
   if (marketError || !markets?.length) return;
@@ -56,8 +56,6 @@ export async function runResolutionChecker() {
 
     if (predsErr || !preds?.length) continue;
 
-    const modelPnls: ResolutionModelPnl[] = [];
-
     for (const p of preds as any[]) {
       const crowd = Number(p.crowd_price_at_time ?? 0);
       const stake = Number(p.stake ?? 100);
@@ -71,12 +69,40 @@ export async function runResolutionChecker() {
           pnl: pnl ?? undefined
         })
         .eq("id", p.id);
-
-      modelPnls.push({
-        model: p.model,
-        pnl: pnl ?? null
-      });
     }
+
+    // Build the social-post model snapshot from canonical rows:
+    // earliest ORIGINAL prediction per model (parent is null) = "official bet".
+    const pnlByPredictionId = new Map<string, number | null>();
+    for (const p of preds as any[]) {
+      const pnl = computePnl(
+        p.signal,
+        Number(p.crowd_price_at_time ?? 0),
+        outcome,
+        Number(p.stake ?? 100)
+      );
+      pnlByPredictionId.set(String(p.id), pnl ?? null);
+    }
+
+    const latestOriginalByModel = new Map<string, any>();
+    const originals = (preds as any[]).filter((p) => p.parent_prediction_id == null);
+    const candidates = originals.length > 0 ? originals : (preds as any[]);
+    const sortedCandidates = candidates.slice().sort((a, b) => {
+      const at = a?.predicted_at ? new Date(a.predicted_at).getTime() : 0;
+      const bt = b?.predicted_at ? new Date(b.predicted_at).getTime() : 0;
+      return at - bt;
+    });
+    for (const p of sortedCandidates) {
+      const model = String(p.model ?? "");
+      if (!MODELS.includes(model as any)) continue;
+      if (!latestOriginalByModel.has(model)) latestOriginalByModel.set(model, p);
+    }
+
+    const modelPnls: ResolutionModelPnl[] = MODELS.map((model) => {
+      const row = latestOriginalByModel.get(model);
+      const pnl = row ? (pnlByPredictionId.get(String(row.id)) ?? null) : null;
+      return { model, pnl };
+    });
 
     const cumulativeByModel = new Map<string, number>();
     for (const model of MODELS) {
@@ -118,7 +144,11 @@ export async function runResolutionChecker() {
 
     resolutionPostQueue.push({
       marketId: market.id,
-      marketUrl: `https://polycast.ai/market/${market.id}`,
+      marketUrl:
+        market.market_url ??
+        (((gamma as any)?.slug
+          ? `https://polymarket.com/event/${(gamma as any).slug}`
+          : "https://polymarket.com/markets") as string),
       socialTitle:
         (market.social_title && market.social_title.length > 0
           ? market.social_title
@@ -137,22 +167,38 @@ export async function runResolutionChecker() {
   for (const model of MODELS) {
     const { data: resolvedPreds } = await supabaseAdmin
       .from("predictions")
-      .select("id, pnl, signal, blind_estimate, outcome")
+      .select(
+        "id, market_id, model, pnl, signal, blind_estimate, outcome, predicted_at, parent_prediction_id"
+      )
       .eq("model", model)
       .eq("resolved", true);
 
-    const bets = (resolvedPreds as any[])?.filter(
-      (r) => r.signal && r.signal !== "PASS"
-    ) ?? [];
+    // Canonical performance row per market/model = earliest original prediction.
+    const canonicalByMarket = new Map<string, any>();
+    const modelRows = (resolvedPreds as any[]) ?? [];
+    const originals = modelRows.filter((r) => r.parent_prediction_id == null);
+    const candidates = originals.length > 0 ? originals : modelRows;
+    const sorted = candidates.slice().sort((a, b) => {
+      const at = a?.predicted_at ? new Date(a.predicted_at).getTime() : 0;
+      const bt = b?.predicted_at ? new Date(b.predicted_at).getTime() : 0;
+      return at - bt;
+    });
+    for (const row of sorted) {
+      const mid = String(row.market_id ?? "");
+      if (!mid) continue;
+      if (!canonicalByMarket.has(mid)) canonicalByMarket.set(mid, row);
+    }
+    const canonicalRows = [...canonicalByMarket.values()];
+
+    const bets = canonicalRows.filter((r) => r.signal && r.signal !== "PASS");
     const wins = bets.filter((b) => (Number(b.pnl) ?? 0) > 0).length;
-    const totalPnl =
-      (resolvedPreds as any[])?.reduce(
-        (sum, r) => sum + (Number(r.pnl) || 0),
-        0
-      ) ?? 0;
+    const totalPnl = canonicalRows.reduce(
+      (sum, r) => sum + (Number(r.pnl) || 0),
+      0
+    );
     const brierScores =
-      (resolvedPreds as any[])
-        ?.filter((r) => r.blind_estimate != null && r.outcome != null)
+      canonicalRows
+        .filter((r) => r.blind_estimate != null && r.outcome != null)
         .map((r) => brierScore(r.blind_estimate, r.outcome)) ?? [];
     const avgBrierModel =
       brierScores.length > 0

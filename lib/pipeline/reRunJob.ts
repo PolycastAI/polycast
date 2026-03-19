@@ -60,7 +60,7 @@ export async function runReRunJob() {
 
   const { data: markets, error: marketError } = await supabaseAdmin
     .from("markets")
-    .select("id, polymarket_id, title, social_title, resolution_date, category")
+    .select("id, polymarket_id, title, social_title, resolution_date, category, market_url")
     .in("id", marketIds);
 
   if (marketError || !markets?.length) return;
@@ -167,7 +167,11 @@ export async function runReRunJob() {
         marketId: market.id,
         socialTitle:
           (market.social_title || market.title) ?? "Market",
-        marketUrl: `https://polycast.ai/market/${market.id}`,
+        marketUrl:
+          market.market_url ??
+          (((gamma as any)?.slug
+            ? `https://polymarket.com/event/${(gamma as any).slug}`
+            : "https://polymarket.com/markets") as string),
         changes
       });
     }

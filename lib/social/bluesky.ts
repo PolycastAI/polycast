@@ -102,12 +102,13 @@ export interface PredictionSummaryForPost {
 
 export async function postPredictionToBluesky(args: {
   marketId: string;
+  marketUrl?: string | null;
   socialTitle: string;
   polymarketProbPercent: number;
   resolutionDate: string | null;
   predictions: PredictionSummaryForPost[];
 }): Promise<string | null> {
-  const { marketId, socialTitle, polymarketProbPercent, resolutionDate } = args;
+  const { marketId, marketUrl, socialTitle, polymarketProbPercent, resolutionDate } = args;
 
   const datePart = resolutionDate
     ? new Date(resolutionDate).toLocaleDateString("en-US", {
@@ -131,8 +132,8 @@ export async function postPredictionToBluesky(args: {
     );
   }
 
-  const link = `https://polycast.ai/market/${marketId}`;
-  lines.push(link);
+  // Use the live Polymarket URL so users can click through to current odds.
+  lines.push(marketUrl ?? "https://polymarket.com/markets");
 
   const text = lines.join("\n");
 
@@ -295,7 +296,9 @@ export async function postWeeklyLeaderboardToBluesky(
 async function sendTextToBluesky(text: string): Promise<string> {
   const session = await createSession();
   if (!session) {
-    throw new Error("Bluesky env vars not set; cannot send queued post");
+    throw new Error(
+      "Bluesky session could not be created. Check BLUESKY_HANDLE / BLUESKY_APP_PASSWORD and credentials."
+    );
   }
 
   const record = {

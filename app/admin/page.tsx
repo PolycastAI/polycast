@@ -162,7 +162,7 @@ async function getAdminData() {
         .sort((a: any, b: any) => {
           const at = a?.predicted_at ? new Date(a.predicted_at).getTime() : 0;
           const bt = b?.predicted_at ? new Date(b.predicted_at).getTime() : 0;
-          return bt - at;
+          return at - bt;
         });
 
       for (const p of sortedResolvedPreds) {
@@ -171,7 +171,7 @@ async function getAdminData() {
         if (!mid || !model || !modelOrder.includes(model)) continue;
         const existing = byMarketModel.get(mid);
         if (!existing) continue;
-        if (existing[model]) continue; // latest original resolved prediction only
+        if (existing[model]) continue; // earliest original resolved prediction only
 
         existing[model] = {
           blind_estimate: p?.blind_estimate ?? null,
