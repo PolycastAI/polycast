@@ -103,6 +103,9 @@ export async function runResolutionChecker() {
       const pnl = row ? (pnlByPredictionId.get(String(row.id)) ?? null) : null;
       return { model, pnl };
     });
+    const canonicalRows = MODELS.map((model) => latestOriginalByModel.get(model)).filter(
+      Boolean
+    ) as any[];
 
     const cumulativeByModel = new Map<string, number>();
     for (const model of MODELS) {
@@ -119,7 +122,7 @@ export async function runResolutionChecker() {
       );
     }
 
-    for (const p of preds as any[]) {
+    for (const p of canonicalRows) {
       const pnl = computePnl(
         p.signal,
         Number(p.crowd_price_at_time ?? 0),
