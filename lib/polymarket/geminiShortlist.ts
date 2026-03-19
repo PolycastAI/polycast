@@ -281,13 +281,29 @@ export async function buildGeminiShortlist(
     const resolutionDate = sel.endDate ? new Date(sel.endDate) : null;
     if (!resolutionDate || isNaN(resolutionDate.getTime())) continue;
     const { daysToResolution, timeBucket } = getTimeBucket(now, resolutionDate);
-    // Polymarket URLs are event-slug based.
-    const slug = (full as { slug?: string | null } | null)?.slug ?? slugById.get(sel.id) ?? null;
-    const safeSlug =
-      typeof slug === "string" && slug.trim().length > 0
-        ? encodeURIComponent(slug.trim())
+    const marketSlug =
+      (full as { slug?: string | null } | null)?.slug ??
+      slugById.get(sel.id) ??
+      null;
+    const eventSlug =
+      (full as { eventSlug?: string | null; events?: Array<{ slug?: string | null }> } | null)
+        ?.eventSlug ??
+      (full as { events?: Array<{ slug?: string | null }> } | null)?.events?.[0]?.slug ??
+      null;
+    const safeMarketSlug =
+      typeof marketSlug === "string" && marketSlug.trim().length > 0
+        ? encodeURIComponent(marketSlug.trim())
         : null;
-    const marketUrl = safeSlug ? `https://polymarket.com/event/${safeSlug}` : null;
+    const safeEventSlug =
+      typeof eventSlug === "string" && eventSlug.trim().length > 0
+        ? encodeURIComponent(eventSlug.trim())
+        : null;
+    const marketUrl =
+      safeEventSlug && safeMarketSlug
+        ? `https://polymarket.com/event/${safeEventSlug}/${safeMarketSlug}`
+        : safeMarketSlug
+          ? `https://polymarket.com/event/${safeMarketSlug}`
+          : null;
     const description = full?.description ?? null;
     const category = full?.category ?? null;
 

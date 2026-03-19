@@ -183,13 +183,28 @@ export async function buildSlotShortlist(
   const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const toShortlist = (item: (typeof filtered)[0]): ShortlistMarket => {
     const { daysToResolution, timeBucket } = getTimeBucket(now, item.resolutionDate);
-    const slug = (item.m as { slug?: string }).slug;
-    // Polymarket market URLs are event-slug based.
-    const safeSlug =
-      typeof slug === "string" && slug.trim().length > 0
-        ? encodeURIComponent(slug.trim())
+    const marketSlug = (item.m as { slug?: string | null }).slug ?? null;
+    const eventSlug =
+      (item.m as {
+        eventSlug?: string | null;
+        events?: Array<{ slug?: string | null }>;
+      }).eventSlug ??
+      (item.m as { events?: Array<{ slug?: string | null }> }).events?.[0]?.slug ??
+      null;
+    const safeMarketSlug =
+      typeof marketSlug === "string" && marketSlug.trim().length > 0
+        ? encodeURIComponent(marketSlug.trim())
         : null;
-    const marketUrl = safeSlug ? `https://polymarket.com/event/${safeSlug}` : null;
+    const safeEventSlug =
+      typeof eventSlug === "string" && eventSlug.trim().length > 0
+        ? encodeURIComponent(eventSlug.trim())
+        : null;
+    const marketUrl =
+      safeEventSlug && safeMarketSlug
+        ? `https://polymarket.com/event/${safeEventSlug}/${safeMarketSlug}`
+        : safeMarketSlug
+          ? `https://polymarket.com/event/${safeMarketSlug}`
+          : null;
     return {
       polymarketId: item.m.id,
       title: item.m.question ?? "Untitled",

@@ -236,12 +236,22 @@ async function getAdminData() {
       if (!pmId || !needsFix) return;
 
       const gamma = await fetchMarketById(pmId);
-      const slug = (gamma as any)?.slug ?? null;
-      const safeSlug =
-        typeof slug === "string" && slug.trim().length > 0
-          ? encodeURIComponent(slug.trim())
+      const marketSlug = (gamma as any)?.slug ?? null;
+      const eventSlug = (gamma as any)?.eventSlug ?? (gamma as any)?.events?.[0]?.slug ?? null;
+      const safeMarketSlug =
+        typeof marketSlug === "string" && marketSlug.trim().length > 0
+          ? encodeURIComponent(marketSlug.trim())
           : null;
-      m.market_url = safeSlug ? `https://polymarket.com/event/${safeSlug}` : null;
+      const safeEventSlug =
+        typeof eventSlug === "string" && eventSlug.trim().length > 0
+          ? encodeURIComponent(eventSlug.trim())
+          : null;
+      m.market_url =
+        safeEventSlug && safeMarketSlug
+          ? `https://polymarket.com/event/${safeEventSlug}/${safeMarketSlug}`
+          : safeMarketSlug
+            ? `https://polymarket.com/event/${safeMarketSlug}`
+            : null;
     };
 
     await Promise.all([...pending, ...approved, ...resolved].map(maybeFixMarketUrl));

@@ -16,7 +16,8 @@ export interface GammaMarket {
   endDateIso?: string | null;
   gameStartTime?: string | null;
   /** Parent event(s); may have endDate */
-  events?: Array<{ id?: string; endDate?: string }> | null;
+  events?: Array<{ id?: string; endDate?: string; slug?: string }> | null;
+  eventSlug?: string | null;
   conditionId?: string | null;
   groupItemTitle?: string | null;
   tags?: Array<{ label?: string; slug?: string }> | null;
