@@ -52,6 +52,7 @@ export function AdminDashboard({
   blueskyPendingPosts: initialBlueskyPendingPosts = [],
   blueskySentPosts: initialBlueskySentPosts = []
 }: Props) {
+  type AdminSection = "pending" | "approved" | "blueskyPending" | "blueskySent";
   const [pending, setPending] = useState(initialPending);
   const [approved, setApproved] = useState(initialApproved);
   const [blueskyPendingPosts, setBlueskyPendingPosts] = useState(
@@ -60,6 +61,7 @@ export function AdminDashboard({
   const [blueskySentPosts, setBlueskySentPosts] = useState(
     initialBlueskySentPosts
   );
+  const [activeSection, setActiveSection] = useState<AdminSection>("pending");
   const [pipelineBusy, setPipelineBusy] = useState(false);
   const [pipelineMessage, setPipelineMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -120,6 +122,27 @@ export function AdminDashboard({
         return;
       }
       setPipelineMessage(`Regenerating approved odds. Refreshing…`);
+      setTimeout(() => window.location.reload(), 1500);
+    } catch (e) {
+      setPipelineMessage(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setPipelineBusy(false);
+    }
+  }
+
+  async function runResolutionCheck() {
+    setPipelineBusy(true);
+    setPipelineMessage(null);
+    try {
+      const res = await fetch("/api/admin/run-resolution", { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPipelineMessage(
+          `Failed: ${(body as { error?: string }).error ?? res.statusText}`
+        );
+        return;
+      }
+      setPipelineMessage("Resolution check finished. Refreshing…");
       setTimeout(() => window.location.reload(), 1500);
     } catch (e) {
       setPipelineMessage(`Error: ${e instanceof Error ? e.message : String(e)}`);
@@ -224,7 +247,7 @@ export function AdminDashboard({
               Pipeline
             </h2>
             <p className="mt-1 text-sm text-slate-400">
-              Fetch fresh markets from Polymarket (Gemini selects 20). Clears current pending and held.
+              Split controls: shortlist pipeline (daily), resolution check (can run multiple times/day), and odds regeneration.
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -234,7 +257,15 @@ export function AdminDashboard({
               disabled={pipelineBusy}
               className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-emerald-500 disabled:opacity-60"
             >
-              {pipelineBusy ? "Running…" : "Run Pipeline"}
+              {pipelineBusy ? "Running…" : "Run Pipeline (New Markets)"}
+            </button>
+            <button
+              type="button"
+              onClick={runResolutionCheck}
+              disabled={pipelineBusy}
+              className="rounded-full border border-cyan-700 bg-slate-950/40 px-4 py-2 text-sm font-semibold text-cyan-200 shadow hover:bg-slate-900 disabled:opacity-60"
+            >
+              {pipelineBusy ? "Working…" : "Run Pipeline (Check Resolved)"}
             </button>
             <button
               type="button"
@@ -251,6 +282,56 @@ export function AdminDashboard({
         </div>
       </section>
 
+      <section className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveSection("pending")}
+            className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
+              activeSection === "pending"
+                ? "bg-emerald-500 text-slate-950"
+                : "border border-slate-700 text-slate-200 hover:border-slate-500"
+            }`}
+          >
+            Pending ({pending.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveSection("approved")}
+            className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
+              activeSection === "approved"
+                ? "bg-emerald-500 text-slate-950"
+                : "border border-slate-700 text-slate-200 hover:border-slate-500"
+            }`}
+          >
+            Approved/Active ({approved.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveSection("blueskyPending")}
+            className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
+              activeSection === "blueskyPending"
+                ? "bg-emerald-500 text-slate-950"
+                : "border border-slate-700 text-slate-200 hover:border-slate-500"
+            }`}
+          >
+            Bluesky Pending ({blueskyPendingPosts.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveSection("blueskySent")}
+            className={`rounded-full px-3 py-1.5 text-xs font-semibold ${
+              activeSection === "blueskySent"
+                ? "bg-emerald-500 text-slate-950"
+                : "border border-slate-700 text-slate-200 hover:border-slate-500"
+            }`}
+          >
+            Bluesky Sent ({blueskySentPosts.length})
+          </button>
+        </div>
+      </section>
+
+      {activeSection === "pending" && (
       <section>
         <h2 className="mb-3 text-lg font-semibold text-slate-100">
           Pending markets ({pending.length}{pending.length !== pendingCount ? ` of ${pendingCount}` : ""})
@@ -352,7 +433,9 @@ export function AdminDashboard({
           </div>
         )}
       </section>
+      )}
 
+      {activeSection === "approved" && (
       <section>
         <h2 className="mb-3 mt-8 text-lg font-semibold text-slate-100">
           Approved/Active markets ({approved.length})
@@ -477,7 +560,9 @@ export function AdminDashboard({
           </div>
         )}
       </section>
+      )}
 
+      {activeSection === "blueskyPending" && (
       <section>
         <h2 className="mb-3 mt-8 text-lg font-semibold text-slate-100">
           Bluesky pending posts ({blueskyPendingPosts.length})
@@ -568,7 +653,9 @@ export function AdminDashboard({
           </div>
         )}
       </section>
+      )}
 
+      {activeSection === "blueskySent" && (
       <section>
         <h2 className="mb-3 mt-10 text-lg font-semibold text-slate-100">
           Bluesky sent posts ({blueskySentPosts.length})
@@ -616,6 +703,7 @@ export function AdminDashboard({
           </div>
         )}
       </section>
+      )}
     </div>
   );
 }
