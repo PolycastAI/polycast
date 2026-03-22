@@ -1,6 +1,5 @@
 import { GammaMarket, ShortlistMarket } from "./types";
 import { getTimeBucket, type TimeBucket } from "../markets/timeBuckets";
-import { resolvePolymarketUrlFromGammaMarket } from "./marketUrl";
 import {
   extractRawCategoryFromGammaMarket,
   mapToStandardCategory
@@ -188,9 +187,8 @@ export async function buildSlotShortlist(
   const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const toShortlist = async (item: (typeof filtered)[0]): Promise<ShortlistMarket> => {
     const { daysToResolution, timeBucket } = getTimeBucket(now, item.resolutionDate);
-    const marketUrl = await resolvePolymarketUrlFromGammaMarket(item.m, {
-      polymarketId: item.m.id
-    });
+    // Polymarket page URL: do not construct here — pick a verbatim API field after inspecting raw Gamma JSON.
+    const marketUrl: string | null = null;
     return {
       polymarketId: item.m.id,
       title: item.m.question ?? "Untitled",
@@ -266,17 +264,51 @@ export async function buildSlotShortlist(
   };
 }
 
-/** Fetch single market by id (for resolution checker / priceUpdater). */
+/**
+ * When `polymarket_id` in DB is a Gamma **event** id, GET /markets/{id} fails.
+ * Fall back to GET /events?id= and use the first nested market (same shape as shortlist).
+ */
+async function fetchFirstMarketFromEventById(eventId: string): Promise<GammaMarket | null> {
+  try {
+    const res = await fetch(`${GAMMA_BASE}/events?id=${encodeURIComponent(eventId)}`, {
+      cache: "no-store"
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const ev = Array.isArray(data) && data.length > 0 ? data[0] : data?.id != null ? data : null;
+    if (!ev || typeof ev !== "object") return null;
+    const rec = ev as Record<string, unknown>;
+    const markets = rec.markets;
+    if (!Array.isArray(markets) || markets.length < 1) return null;
+    const m0 = markets[0] as Record<string, unknown>;
+    return {
+      ...(m0 as unknown as GammaMarket),
+      id: (m0.id as string) ?? eventId,
+      question: (m0.question as string | null) ?? (typeof rec.title === "string" ? rec.title : null),
+      description: (m0.description as string | null) ?? (rec.description as string | null),
+      endDate: (m0.endDate as string | null) ?? (rec.endDate as string | null),
+      volume: rec.volume ?? m0.volume,
+      closed: rec.closed ?? m0.closed,
+      active: rec.active ?? m0.active
+    } as GammaMarket;
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch single market by id, or first market under an event id (shortlist stores event ids). */
 export async function fetchMarketById(polymarketId: string): Promise<GammaMarket | null> {
   try {
     const res = await fetch(`${GAMMA_BASE}/markets/${encodeURIComponent(polymarketId)}`, {
       cache: "no-store"
     });
-    if (!res.ok) return null;
-    return (await res.json()) as GammaMarket;
+    if (res.ok) {
+      return (await res.json()) as GammaMarket;
+    }
   } catch {
-    return null;
+    // try event id
   }
+  return fetchFirstMarketFromEventById(polymarketId);
 }
 
 /** Resolved YES = true, NO = false, not closed or unclear = null. */

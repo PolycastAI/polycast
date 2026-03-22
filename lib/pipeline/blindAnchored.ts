@@ -321,21 +321,26 @@ async function runBlindAndAnchoredForMarket(m: any) {
   await runBlindAndAnchoredForMarketWithId(marketId, m);
 }
 
-async function getExcludedPolymarketIds(): Promise<string[]> {
+/**
+ * Shortlist dedup: held markets, plus rejected rows still in cooldown (resurface_at strictly in the future).
+ * Does not exclude rejected rows with null/past resurface_at (eligible to reappear).
+ */
+/** @internal Exported for /api/markets/shortlist alignment */
+export async function getExcludedPolymarketIds(): Promise<string[]> {
   const now = new Date().toISOString();
-  const { data: rejected } = await supabaseAdmin
+  const { data: rejectedCooldown } = await supabaseAdmin
     .from("rejected_markets")
     .select("market_id")
-    .or(`resurface_at.is.null,resurface_at.gte.${now}`);
+    .gt("resurface_at", now);
   const { data: held } = await supabaseAdmin
     .from("held_markets")
     .select("market_id");
   const ids = new Set<string>();
-  for (const r of rejected ?? []) {
-    ids.add((r as any).market_id);
+  for (const r of rejectedCooldown ?? []) {
+    ids.add(String((r as { market_id: string }).market_id));
   }
   for (const h of held ?? []) {
-    ids.add((h as any).market_id);
+    ids.add(String((h as { market_id: string }).market_id));
   }
   return [...ids];
 }
@@ -358,25 +363,15 @@ export async function runBlindAndAnchoredPipeline() {
 
   const shortlist = await buildGeminiShortlist(existingIds, excludedIds);
   console.log(
-    `Fetched ${shortlist.debug.totalFetched} markets, ` +
-      `stripped ${shortlist.debug.strippedCount}, ` +
-      `shortlist size ${shortlist.markets.length}.`
+    `[pipeline] Shortlist debug: raw events=${shortlist.debug.totalFetched}, ` +
+      `after structural filters=${shortlist.debug.afterStructuralFilters}, ` +
+      `after dedup=${shortlist.debug.afterDedup}, final=${shortlist.debug.afterGemini}`
   );
-  console.log("Final selected markets:");
-  for (const m of shortlist.markets) {
-    console.log({
-      question: m.title,
-      crowd_price: m.crowd_price,
-      volume: m.volume,
-      days_to_resolution: m.days_to_resolution,
-      time_bucket: m.time_bucket
-    });
-  }
 
   // Telegram notification to trigger approval dashboard usage.
   await sendTelegramMessage(
     `Polycast pipeline starting.\n` +
-      `Candidates: ${shortlist.debug.strippedCount}. Shortlist: ${shortlist.markets.length}.\n\n` +
+      `Candidates (post-dedup pool): ${shortlist.debug.afterDedup}. Shortlist: ${shortlist.markets.length}.\n\n` +
       `Open /admin to review and approve markets.`
   );
 
@@ -423,18 +418,24 @@ export async function runShortlistAndNotifyOnly() {
       getExcludedPolymarketIds()
     ]);
     const shortlist = await buildGeminiShortlist(existingIds, excludedIds);
-    console.log("Final selected markets:");
-    for (const m of shortlist.markets) {
-      console.log({
-        question: m.title,
-        crowd_price: m.crowd_price,
-        volume: m.volume,
-        days_to_resolution: m.days_to_resolution,
-        time_bucket: m.time_bucket
-      });
+
+    const canWrite = process.env.POLYCAST_SHORTLIST_WRITE_ENABLED === "true";
+    if (!canWrite) {
+      console.warn(
+        "[shortlist] Skipping database write (reset_and_insert_shortlist). " +
+          "Set POLYCAST_SHORTLIST_WRITE_ENABLED=true after verifying logs."
+      );
+      await sendTelegramMessage(
+        `Polycast shortlist dry run (no DB write).\n` +
+          `Raw events: ${shortlist.debug.totalFetched}. Structural: ${shortlist.debug.afterStructuralFilters}. ` +
+          `Pool: ${shortlist.debug.afterDedup}. Selected: ${shortlist.markets.length}.\n` +
+          `Set POLYCAST_SHORTLIST_WRITE_ENABLED=true to persist.`
+      );
+      return { count: shortlist.markets.length };
     }
-    // Step 7: Atomic reset + insert via DB function so cleanup and write happen together.
-    console.log("PIPELINE START — deleting pending markets (inside reset_and_insert_shortlist)");
+
+    // Atomic reset + insert via DB function (clears pending + held, then inserts).
+    console.log("PIPELINE START — deleting pending/held markets (inside reset_and_insert_shortlist)");
     const payload = shortlist.markets.map((m) => ({
       polymarket_id: m.polymarketId,
       title: m.title,
@@ -475,7 +476,7 @@ export async function runShortlistAndNotifyOnly() {
 
     await sendTelegramMessage(
       `Polycast shortlist ready.\n` +
-        `Candidates: ${shortlist.debug.strippedCount}. Shortlist: ${shortlist.markets.length}.\n` +
+        `Pool (post-dedup): ${shortlist.debug.afterDedup}. Shortlist: ${shortlist.markets.length}.\n` +
         `DB pending count: ${pendingCount ?? 0}.\n\n` +
         `Admin: https://polycast-blue.vercel.app/admin`
     );

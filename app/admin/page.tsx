@@ -2,8 +2,6 @@ import { unstable_noStore } from "next/cache";
 import { AdminDashboard } from "@/components/admin/AdminDashboard";
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { getTimeBucket } from "@/lib/markets/timeBuckets";
-import { fetchMarketById } from "@/lib/polymarket/gamma";
-import { resolvePolymarketUrlFromGammaMarket } from "@/lib/polymarket/marketUrl";
 
 export const dynamic = "force-dynamic";
 
@@ -225,24 +223,6 @@ async function getAdminData() {
         }
       }
     }
-
-    // Backfill display-only when DB has no URL or legacy `/market/{id}` placeholder — use Gamma API fields only.
-    const maybeFixMarketUrl = async (m: any) => {
-      const pmId = m?.polymarket_id;
-      if (!pmId) return;
-      const existing = m?.market_url as string | null;
-      const needsFix =
-        existing == null ||
-        existing === "" ||
-        (typeof existing === "string" && existing.includes("polymarket.com/market/"));
-      if (!needsFix) return;
-
-      const gamma = await fetchMarketById(pmId);
-      if (!gamma) return;
-      m.market_url = await resolvePolymarketUrlFromGammaMarket(gamma, { polymarketId: pmId });
-    };
-
-    await Promise.all([...pending, ...approved, ...resolved].map(maybeFixMarketUrl));
 
     // Bluesky posts audit log:
     // - pending: status = 'pending'

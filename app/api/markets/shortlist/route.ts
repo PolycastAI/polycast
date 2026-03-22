@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { buildGeminiShortlist } from "@/lib/polymarket/geminiShortlist";
 import { supabaseAdmin } from "@/lib/supabase/server";
+import { getExcludedPolymarketIds } from "@/lib/pipeline/blindAnchored";
 
 export const dynamic = "force-dynamic";
 
@@ -17,19 +18,11 @@ export async function GET() {
         ?.map((row: any) => row.markets?.polymarket_id)
         .filter(Boolean) ?? [];
 
-    const now = new Date().toISOString();
-    const { data: rejected } = await supabaseAdmin
-      .from("rejected_markets")
-      .select("market_id")
-      .or(`resurface_at.is.null,resurface_at.gte.${now}`);
-    const { data: held } = await supabaseAdmin.from("held_markets").select("market_id");
-    const excludedIds = new Set<string>();
-    for (const r of rejected ?? []) excludedIds.add((r as any).market_id);
-    for (const h of held ?? []) excludedIds.add((h as any).market_id);
+    const excludedIds = await getExcludedPolymarketIds();
 
     const shortlist = await buildGeminiShortlist(
       existingPolymarketIds,
-      [...excludedIds]
+      excludedIds
     );
 
     return NextResponse.json(shortlist, { status: 200 });

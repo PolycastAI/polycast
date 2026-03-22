@@ -2,7 +2,6 @@
 
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { fetchMarketById, getResolutionOutcome } from "@/lib/polymarket/gamma";
-import { resolvePolymarketUrlFromGammaMarket } from "@/lib/polymarket/marketUrl";
 import { computePnl, brierScore } from "@/lib/pipeline/pnl";
 import {
   postResolutionToBluesky,
@@ -150,9 +149,7 @@ export async function runResolutionChecker() {
       row.cumulativePnl = cumulativeByModel.get(row.model) ?? 0;
     }
 
-    const resolvedUrl =
-      market.market_url ??
-      (await resolvePolymarketUrlFromGammaMarket(gamma, { polymarketId: polymarketId }));
+    const resolvedUrl = market.market_url ?? null;
 
     await supabaseAdmin
       .from("markets")

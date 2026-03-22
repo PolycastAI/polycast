@@ -11,7 +11,7 @@ export interface GammaMarket {
   endDate?: string | null;
   startDate?: string | null;
   category?: string | null;
-  /** Canonical page URL when provided by Gamma (prefer over constructing from slugs). */
+  /** Possible page URL fields from Gamma — inspect raw JSON; app does not build URLs from title/question. */
   url?: string | null;
   marketUrl?: string | null;
   slug?: string | null;

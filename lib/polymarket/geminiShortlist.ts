@@ -1,141 +1,182 @@
 /**
- * Market selection via Gemini: fetch raw markets, strip to minimal fields,
- * prompt Gemini for 20 selections, fetch full details for description, dedup, return ShortlistMarket[].
+ * Shortlist: fetch Gamma /events, filter, Gemini (gemini-2.5-flash) picks 20,
+ * enrich from cached event objects only (no extra Polymarket API calls).
  */
 
 import { parseGeminiJsonArray } from "@/lib/ai/geminiJson";
 import { getTimeBucket } from "@/lib/markets/timeBuckets";
-import type { ShortlistMarket, GammaMarket } from "./types";
-import { fetchMarketById } from "./gamma";
-import { resolvePolymarketUrlFromGammaMarket } from "./marketUrl";
+import type { ShortlistMarket } from "./types";
 import {
-  extractRawCategoryFromGammaMarket,
   mapToStandardCategory,
   enrichShortlistWithGeminiGeographyAndCategories
 } from "./categoryAndGeography";
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-const GEMINI_SYSTEM_PROMPT = `You are a market selection agent for Polycast, an AI prediction market forecasting service. Every day you select the 20 most interesting Polymarket markets for four AI models to forecast head-to-head.
+const EVENTS_URL = `${GAMMA_BASE}/events?active=true&closed=false&limit=100&order=volume&ascending=false`;
 
-Select 20 markets from the list provided. Your selection must:
+const GEMINI_SYSTEM_PROMPT = `You are a market selection agent for Polycast, an AI prediction market forecasting service. Every day you select the 20 most interesting Polymarket events for four AI models to forecast head-to-head.
+
+Select 20 events from the list provided. Your selection must:
 - Only include binary YES/NO markets with a probability between 10% and 90%
-- Only include markets with a known resolution date
-- Only include markets with volume above $5,000
-- Include a mix of resolution timeframes — some resolving in 2-7 days, some in 8-30 days, some in 31+ days. Avoid markets resolving today.
+- Only include events with a known resolution date
+- Only include events with volume above $5,000
+- Include a mix of resolution timeframes — some resolving in 2-7 days, some in 8-30 days, some in 31+ days. Avoid events resolving today.
 - Include genuine variety across all topics and categories present in the list — politics, economics, crypto, sports, tech, AI, science, culture, entertainment, geopolitics, business, legal, environment, or anything else that appears. Do not over-represent any single category. Spread the selection as broadly as possible across whatever topics are available.
-- Prioritise markets that are genuinely uncertain, interesting to forecast, and likely to generate engagement — markets in the news, markets with recent volume spikes, markets where reasonable people disagree
-- Avoid duplicate topics — don't pick two markets about the same underlying event
+- Prioritise events that are genuinely uncertain, interesting to forecast, and likely to generate engagement — events in the news, events with recent volume spikes, events where reasonable people disagree
+- Avoid duplicate topics — don't pick two events about the same underlying topic
 
-Return ONLY a valid JSON array with no markdown, no preamble. Each object must have only: id, question, crowd_price (YES probability as integer 0-100), endDate (ISO string), volume (number). In the JSON: use no newlines inside string values, and escape any double-quotes inside question text with a backslash (e.g. \\").`;
+Return ONLY a valid JSON array with no markdown, no preamble. Each object must have only: id, title, crowd_price (YES probability as integer 0-100), endDate (ISO string), volume (number). In the JSON: use no newlines inside string values, and escape any double-quotes inside title text with a backslash (e.g. \\").`;
 
-/** Raw market row we send to Gemini (no description). */
-export interface StrippedMarket {
-  id: string;
-  question: string;
-  endDate: string;
+/** Fully parsed event after structural filters (cache for post-Gemini). */
+export interface ParsedGammaEvent {
+  polymarketId: string;
+  title: string;
+  slug: string;
+  description: string | null;
+  endDate: Date;
+  endDateIso: string;
+  startDate: Date | null;
   volume: number;
-  yesPrice: number;
-  slug?: string | null;
-}
-
-function parseOutcomes(raw: string | string[] | null | undefined): string[] {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw.map(String);
-  try {
-    const p = JSON.parse(String(raw));
-    return Array.isArray(p) ? p.map(String) : [];
-  } catch {
-    return String(raw).split(",").map((s) => s.trim());
-  }
+  liquidity: number;
+  category: string | null;
+  crowd_price: number;
+  yesProbability: number;
+  market_url: string;
 }
 
 function parsePrices(raw: string | string[] | null | undefined): number[] {
-  if (!raw) return [];
+  if (raw == null) return [];
   if (Array.isArray(raw)) return raw.map((p) => Number(p));
   try {
     const p = JSON.parse(String(raw));
     return Array.isArray(p) ? p.map((x: unknown) => Number(x)) : [];
   } catch {
-    return String(raw).split(",").map((s) => Number(s.trim()));
+    return String(raw)
+      .split(",")
+      .map((s) => Number(s.trim()))
+      .filter((n) => !Number.isNaN(n));
   }
 }
 
-function getYesPrice(m: GammaMarket): number | null {
-  const outcomes = parseOutcomes(m.outcomes);
-  const prices = parsePrices(m.outcomePrices);
-  if (outcomes.length !== 2 || prices.length !== 2) return null;
-  const yesIdx = outcomes.findIndex((o) => String(o).toLowerCase() === "yes");
-  if (yesIdx === -1) return null;
-  const v = prices[yesIdx];
-  return Number.isFinite(v) ? v : null;
-}
-
-/** Fetch raw markets from Gamma (limit 100, by volume desc). */
-async function fetchRawMarkets(): Promise<GammaMarket[]> {
-  const url = `${GAMMA_BASE}/markets?active=true&closed=false&limit=100&order=volume&ascending=false`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) return [];
-  const data = await res.json();
-  const list = Array.isArray(data) ? data : data?.markets ?? [];
-  return Array.isArray(list) ? list : [];
+function num(v: unknown): number {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") return Number(v);
+  return NaN;
 }
 
 /**
- * Strip to id, question, endDate, volume, yesPrice. Only include binary 10–90%, volume > 5000, has endDate.
+ * Parse one Gamma event; returns null if it fails structural filters.
  */
-function stripMarkets(raw: GammaMarket[]): StrippedMarket[] {
-  const out: StrippedMarket[] = [];
-  for (const m of raw) {
-    if (m.active !== true || m.closed === true) continue;
-    const outcomes = parseOutcomes(m.outcomes);
-    const prices = parsePrices(m.outcomePrices);
-    if (outcomes.length !== 2 || prices.length !== 2) continue;
-    const yesPrice = getYesPrice(m);
-    if (yesPrice == null || yesPrice < 0.1 || yesPrice > 0.9) continue;
-    const volume = Number(m.volume ?? 0);
-    if (volume < 5000) continue;
-    // Prefer market's own resolution fields; fall back to parent event's endDate if present.
-    const endDate =
-      m.endDate ??
-      (m as { endDateIso?: string }).endDateIso ??
-      m.gameStartTime ??
-      m.events?.[0]?.endDate ??
-      null;
-    if (!endDate) continue;
-    out.push({
-      id: m.id,
-      question: m.question ?? "Untitled",
-      endDate: String(endDate),
-      volume,
-      yesPrice,
-      slug: m.slug ?? null
-    });
-  }
-  return out;
+export function tryParseGammaEvent(ev: unknown): ParsedGammaEvent | null {
+  if (!ev || typeof ev !== "object") return null;
+  const e = ev as Record<string, unknown>;
+
+  if (e.active !== true || e.closed !== false) return null;
+
+  const markets = e.markets;
+  if (!Array.isArray(markets) || markets.length < 1) return null;
+
+  const m0 = markets[0];
+  if (!m0 || typeof m0 !== "object") return null;
+  const m = m0 as Record<string, unknown>;
+
+  const opRaw = m.outcomePrices;
+  if (opRaw == null) return null;
+
+  const prices = parsePrices(opRaw as string | string[]);
+  if (prices.length !== 2) return null;
+
+  const yesDecimal = prices[0];
+  if (!Number.isFinite(yesDecimal) || yesDecimal < 0.1 || yesDecimal > 0.9) return null;
+
+  const volume = num(e.volume);
+  if (!Number.isFinite(volume) || volume <= 5000) return null;
+
+  const endRaw = e.endDate ?? e.endDateIso;
+  if (endRaw == null || endRaw === "") return null;
+  const endDate = new Date(String(endRaw));
+  if (isNaN(endDate.getTime())) return null;
+
+  const id = e.id != null ? String(e.id) : "";
+  if (!id) return null;
+
+  const slug = typeof e.slug === "string" && e.slug.trim() ? e.slug.trim() : "";
+  if (!slug) return null;
+
+  const title = typeof e.title === "string" ? e.title : "";
+  if (!title.trim()) return null;
+
+  const description =
+    typeof e.description === "string" ? e.description : e.description == null ? null : String(e.description);
+
+  const startRaw = e.startDate ?? e.startDateIso;
+  const startDate =
+    startRaw != null && startRaw !== ""
+      ? new Date(String(startRaw))
+      : null;
+  const startDateOk = startDate && !isNaN(startDate.getTime()) ? startDate : null;
+
+  const liquidity = num(e.liquidity);
+  const liquidityOk = Number.isFinite(liquidity) ? liquidity : 0;
+
+  const category =
+    typeof e.category === "string" && e.category.trim()
+      ? e.category.trim()
+      : null;
+
+  const crowd_price = Math.round(yesDecimal * 100);
+  const market_url = `https://polymarket.com/event/${slug}`;
+
+  return {
+    polymarketId: id,
+    title: title.trim(),
+    slug,
+    description,
+    endDate,
+    endDateIso: endDate.toISOString(),
+    startDate: startDateOk,
+    volume,
+    liquidity: liquidityOk,
+    category,
+    crowd_price,
+    yesProbability: yesDecimal,
+    market_url
+  };
 }
 
-/** Call Gemini for N selections from the given list. Returns array of { id, question, crowd_price, endDate, volume }. */
+async function fetchRawEvents(): Promise<unknown[]> {
+  const res = await fetch(EVENTS_URL, { cache: "no-store" });
+  if (!res.ok) {
+    console.warn("[shortlist] /events fetch failed:", res.status);
+    return [];
+  }
+  const data = await res.json();
+  const list = Array.isArray(data) ? data : data?.events ?? data?.data ?? [];
+  return Array.isArray(list) ? list : [];
+}
+
+export interface StrippedForGemini {
+  id: string;
+  title: string;
+  endDate: string;
+  volume: number;
+  crowd_price: number;
+}
+
+/** Call Gemini for N selections. Returns rows (match final selection by id to cache only). */
 async function callGeminiForSelection(
-  strippedList: StrippedMarket[],
+  strippedList: StrippedForGemini[],
   wantCount: number
-): Promise<{ id: string; question: string; crowd_price: number; endDate: string; volume: number }[]> {
+): Promise<{ id: string; title: string; crowd_price: number; endDate: string; volume: number }[]> {
   const apiKey = process.env.GOOGLE_AI_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_AI_API_KEY is not set");
 
-  // Send only the fields requested in the system prompt.
-  const safeList = strippedList.map((s) => ({
-    id: s.id,
-    question: s.question,
-    endDate: s.endDate,
-    volume: s.volume,
-    yesPrice: s.yesPrice
-  }));
-  const userContent = JSON.stringify(safeList);
+  const userContent = JSON.stringify(strippedList);
   const instruction =
     wantCount >= strippedList.length
-      ? `Select all ${strippedList.length} markets from this list. Return only a JSON array.\n\n`
-      : `Select exactly ${wantCount} markets from this list. Return only a JSON array.\n\n`;
+      ? `Select all ${strippedList.length} events from this list. Return only a JSON array.\n\n`
+      : `Select exactly ${wantCount} events from this list. Return only a JSON array.\n\n`;
 
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
@@ -167,7 +208,7 @@ async function callGeminiForSelection(
   return arr
     .map((o: any) => ({
       id: String(o?.id ?? ""),
-      question: String(o?.question ?? ""),
+      title: String(o?.title ?? ""),
       crowd_price: Number(o?.crowd_price) || 0,
       endDate: String(o?.endDate ?? ""),
       volume: Number(o?.volume) ?? 0
@@ -175,22 +216,32 @@ async function callGeminiForSelection(
     .filter((x: { id: string }) => x.id);
 }
 
-/** Fetch full market by id to get description. */
-async function fetchFullMarket(polymarketId: string): Promise<GammaMarket | null> {
-  return fetchMarketById(polymarketId);
-}
-
 export interface GeminiShortlistResult {
   markets: ShortlistMarket[];
   debug: {
     totalFetched: number;
-    strippedCount: number;
+    /** Structural filters only (before prediction/rejected/held dedup). */
+    afterStructuralFilters: number;
+    /** After requiring days_to_resolution > 0 (before dedup). */
+    afterDaysToResolutionFilter: number;
+    /** After dedup; pool sent to Gemini. */
     afterDedup: number;
+    afterGemini: number;
+  };
+}
+
+function toStripped(e: ParsedGammaEvent): StrippedForGemini {
+  return {
+    id: e.polymarketId,
+    title: e.title,
+    endDate: e.endDateIso,
+    volume: e.volume,
+    crowd_price: e.crowd_price
   };
 }
 
 /**
- * Build shortlist via Gemini: fetch raw → strip → Gemini select 20 → fetch full for description → dedup (re-prompt to fill).
+ * Build shortlist: GET /events → filter → dedup → Gemini (20) → map from cache only.
  */
 export async function buildGeminiShortlist(
   existingPolymarketIds: string[],
@@ -199,27 +250,60 @@ export async function buildGeminiShortlist(
   const existingSet = new Set(existingPolymarketIds);
   const excludedSet = new Set(excludedPolymarketIds);
 
-  const raw = await fetchRawMarkets();
-  const stripped = stripMarkets(raw);
-  const pool = stripped.filter((s) => !existingSet.has(s.id) && !excludedSet.has(s.id));
+  const raw = await fetchRawEvents();
 
-  let selected: { id: string; question: string; crowd_price: number; endDate: string; volume: number }[] = [];
-  const wantFirst = Math.min(20, pool.length);
-  if (pool.length > 0) {
-    const first = await callGeminiForSelection(pool, wantFirst);
-    selected = first.filter((x) => x.id && !existingSet.has(x.id) && !excludedSet.has(x.id));
+  const structural: ParsedGammaEvent[] = [];
+  for (const row of raw) {
+    const p = tryParseGammaEvent(row);
+    if (p) structural.push(p);
   }
 
-  // Dedup: replace any removed by re-prompting with remaining pool until we have 20 or pool exhausted.
+  console.log(
+    `[shortlist] Events passing structural filters (before prediction/rejected/held dedup): ${structural.length}`
+  );
+
+  const nowForFilter = new Date();
+  const afterPositiveDays = structural.filter((p) => {
+    const { daysToResolution } = getTimeBucket(nowForFilter, p.endDate);
+    return daysToResolution != null && daysToResolution > 0;
+  });
+
+  console.log(
+    `[shortlist] Events after days_to_resolution > 0 filter (before dedup): ${afterPositiveDays.length}`
+  );
+
+  const pool = afterPositiveDays.filter(
+    (p) => !existingSet.has(p.polymarketId) && !excludedSet.has(p.polymarketId)
+  );
+
+  console.log(
+    `[shortlist] Candidate pool for Gemini (after dedup): ${pool.length}`
+  );
+
+  const poolStripped = pool.map(toStripped);
+
+  let selected: { id: string; title: string; crowd_price: number; endDate: string; volume: number }[] =
+    [];
+  const wantFirst = Math.min(20, poolStripped.length);
+  if (poolStripped.length > 0) {
+    const first = await callGeminiForSelection(poolStripped, wantFirst);
+    selected = first.filter(
+      (x) => x.id && !existingSet.has(x.id) && !excludedSet.has(x.id)
+    );
+  }
+
+  const cache = new Map<string, ParsedGammaEvent>();
+  for (const p of pool) cache.set(p.polymarketId, p);
+
   const maxRounds = 5;
   let round = 0;
   while (selected.length < 20 && round < maxRounds) {
     round += 1;
     const alreadyIds = new Set(selected.map((s) => s.id));
-    const remainingPool = pool.filter((s) => !alreadyIds.has(s.id));
-    if (remainingPool.length === 0) break;
-    const need = Math.min(20 - selected.length, remainingPool.length);
-    const more = await callGeminiForSelection(remainingPool, need);
+    const remainingStripped = poolStripped.filter((s) => !alreadyIds.has(s.id));
+    if (remainingStripped.length === 0) break;
+    const need = Math.min(20 - selected.length, remainingStripped.length);
+    const more = await callGeminiForSelection(remainingStripped, need);
     for (const x of more) {
       if (!x.id || existingSet.has(x.id) || excludedSet.has(x.id) || alreadyIds.has(x.id)) continue;
       selected.push(x);
@@ -232,32 +316,31 @@ export async function buildGeminiShortlist(
   const markets: ShortlistMarket[] = [];
 
   for (const sel of selected.slice(0, 20)) {
-    const full = await fetchFullMarket(sel.id);
-    const resolutionDate = sel.endDate ? new Date(sel.endDate) : null;
-    if (!resolutionDate || isNaN(resolutionDate.getTime())) continue;
-    const { daysToResolution, timeBucket } = getTimeBucket(now, resolutionDate);
-    const marketUrl = full
-      ? await resolvePolymarketUrlFromGammaMarket(full, { polymarketId: sel.id })
-      : null;
-    const description = full?.description ?? null;
-    const categoryRaw = extractRawCategoryFromGammaMarket(full);
-    const category = mapToStandardCategory(categoryRaw) ?? null;
+    const ev = cache.get(sel.id);
+    if (!ev) {
+      console.warn("[shortlist] Gemini selected unknown id (not in cache):", sel.id);
+      continue;
+    }
+
+    const { daysToResolution, timeBucket } = getTimeBucket(now, ev.endDate);
+    const categoryRaw = ev.category;
+    const category = categoryRaw ? mapToStandardCategory(categoryRaw) ?? categoryRaw : null;
 
     markets.push({
-      polymarketId: sel.id,
-      title: sel.question,
-      description,
-      resolutionDate,
-      crowd_price: sel.crowd_price,
-      volume: sel.volume,
-      startDate: null,
+      polymarketId: ev.polymarketId,
+      title: ev.title,
+      description: ev.description,
+      resolutionDate: ev.endDate,
+      crowd_price: ev.crowd_price,
+      volume: ev.volume,
+      startDate: ev.startDate,
       category,
       categoryFromApiRaw: categoryRaw,
       marketGeography: null,
       days_to_resolution: daysToResolution,
       time_bucket: timeBucket,
-      marketUrl,
-      probability: sel.crowd_price / 100,
+      marketUrl: ev.market_url,
+      probability: ev.yesProbability,
       daysToResolution,
       timeBucket
     });
@@ -265,12 +348,25 @@ export async function buildGeminiShortlist(
 
   await enrichShortlistWithGeminiGeographyAndCategories(markets);
 
+  for (const m of markets) {
+    console.log("[shortlist] Selected event (final):", {
+      title: m.title,
+      crowd_price: m.crowd_price,
+      volume: m.volume,
+      days_to_resolution: m.days_to_resolution,
+      time_bucket: m.time_bucket,
+      market_url: m.marketUrl
+    });
+  }
+
   return {
     markets,
     debug: {
       totalFetched: raw.length,
-      strippedCount: stripped.length,
-      afterDedup: markets.length
+      afterStructuralFilters: structural.length,
+      afterDaysToResolutionFilter: afterPositiveDays.length,
+      afterDedup: pool.length,
+      afterGemini: markets.length
     }
   };
 }
