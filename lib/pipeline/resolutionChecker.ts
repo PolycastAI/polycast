@@ -2,6 +2,7 @@
 
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { fetchMarketById, getResolutionOutcome } from "@/lib/polymarket/gamma";
+import { resolvePolymarketUrlFromGammaMarket } from "@/lib/polymarket/marketUrl";
 import { computePnl, brierScore } from "@/lib/pipeline/pnl";
 import {
   postResolutionToBluesky,
@@ -32,14 +33,18 @@ export async function runResolutionChecker() {
 
   if (marketError || !markets?.length) return;
 
-  const resolutionPostQueue: Array<{
-    marketId: string;
-    marketUrl: string;
-    socialTitle: string;
-    outcome: boolean;
-    modelPnls: ResolutionModelPnl[];
-    includeCumulative: boolean;
-  }> = [];
+  // Same for all resolution posts in this run; compute once (do not defer posts until after model_performance).
+  const week3Cutoff = Date.now() - 21 * 24 * 60 * 60 * 1000;
+  const { data: firstPred } = await supabaseAdmin
+    .from("predictions")
+    .select("predicted_at")
+    .order("predicted_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  const includeCumulative: boolean = Boolean(
+    firstPred &&
+      new Date((firstPred as any).predicted_at).getTime() < week3Cutoff
+  );
 
   for (const market of markets as any[]) {
     const polymarketId = market.polymarket_id;
@@ -145,33 +150,38 @@ export async function runResolutionChecker() {
       row.cumulativePnl = cumulativeByModel.get(row.model) ?? 0;
     }
 
-    resolutionPostQueue.push({
-      marketId: market.id,
-      marketUrl:
-        market.market_url ??
-        ((() => {
-          const slug = (gamma as any)?.slug;
-          const safeSlug =
-            typeof slug === "string" && slug.trim().length > 0
-              ? encodeURIComponent(slug.trim())
-              : null;
-          return safeSlug
-            ? `https://polymarket.com/event/${safeSlug}`
-            : "https://polymarket.com/markets";
-        })() as string),
-      socialTitle:
-        (market.social_title && market.social_title.length > 0
-          ? market.social_title
-          : market.title) ?? "Market",
-      outcome,
-      modelPnls,
-      includeCumulative: false
-    });
+    const resolvedUrl =
+      market.market_url ??
+      (await resolvePolymarketUrlFromGammaMarket(gamma, { polymarketId: polymarketId }));
 
     await supabaseAdmin
       .from("markets")
       .update({ status: "resolved" })
       .eq("id", market.id);
+
+    // Queue draft social post immediately so a later failure (e.g. model_performance) cannot skip it.
+    // Do not sleep between posts — serverless invocations will time out on long delays.
+    try {
+      await postResolutionToBluesky({
+        marketId: market.id,
+        socialTitle:
+          (market.social_title && market.social_title.length > 0
+            ? market.social_title
+            : market.title) ?? "Market",
+        outcome,
+        modelPnls,
+        marketUrl: resolvedUrl,
+        includeCumulative
+      });
+      console.log(
+        `[resolutionChecker] Queued resolution draft for market ${market.id} (${polymarketId})`
+      );
+    } catch (err) {
+      console.error(
+        `[resolutionChecker] Failed to queue resolution social post for market ${market.id}:`,
+        err
+      );
+    }
   }
 
   for (const model of MODELS) {
@@ -246,36 +256,6 @@ export async function runResolutionChecker() {
         total_pnl: totalPnl,
         brier_score: avgBrierModel
       });
-    }
-  }
-
-  const week3Cutoff = Date.now() - 21 * 24 * 60 * 60 * 1000;
-  const { data: firstPred } = await supabaseAdmin
-    .from("predictions")
-    .select("predicted_at")
-    .order("predicted_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  const includeCumulative: boolean = Boolean(
-    firstPred &&
-      new Date((firstPred as any).predicted_at).getTime() < week3Cutoff
-  );
-
-  for (let i = 0; i < resolutionPostQueue.length; i++) {
-    const item = resolutionPostQueue[i];
-    if (item.includeCumulative !== includeCumulative) {
-      item.includeCumulative = includeCumulative;
-    }
-    await postResolutionToBluesky({
-      marketId: item.marketId,
-      socialTitle: item.socialTitle,
-      outcome: item.outcome,
-      modelPnls: item.modelPnls,
-      marketUrl: item.marketUrl,
-      includeCumulative: item.includeCumulative
-    });
-    if (i < resolutionPostQueue.length - 1) {
-      await new Promise((r) => setTimeout(r, 30 * 60 * 1000));
     }
   }
 

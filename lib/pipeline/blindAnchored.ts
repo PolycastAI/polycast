@@ -61,7 +61,8 @@ async function upsertMarketFromShortlist(m: any) {
       {
         polymarket_id: m.polymarketId,
         title: m.title,
-        category: m.category,
+        category: m.category ?? null,
+        market_geography: m.marketGeography ?? null,
         resolution_date: m.resolutionDate?.toISOString() ?? null,
         resolution_criteria: m.description ?? null,
         market_url: m.marketUrl,
@@ -438,6 +439,7 @@ export async function runShortlistAndNotifyOnly() {
       polymarket_id: m.polymarketId,
       title: m.title,
       category: m.category ?? null,
+      market_geography: m.marketGeography ?? null,
       resolution_date: m.resolutionDate ? m.resolutionDate.toISOString() : null,
       resolution_criteria: m.description ?? null,
       market_url: m.marketUrl ?? null,

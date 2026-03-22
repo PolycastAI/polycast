@@ -11,12 +11,25 @@ export interface GammaMarket {
   endDate?: string | null;
   startDate?: string | null;
   category?: string | null;
+  /** Canonical page URL when provided by Gamma (prefer over constructing from slugs). */
+  url?: string | null;
+  marketUrl?: string | null;
   slug?: string | null;
+  eventId?: string | null;
+  event?: { id?: string; slug?: string | null; url?: string | null; marketUrl?: string | null } | null;
   /** API sometimes returns endDate as YYYY-MM-DD only */
   endDateIso?: string | null;
   gameStartTime?: string | null;
   /** Parent event(s); may have endDate */
-  events?: Array<{ id?: string; endDate?: string; slug?: string }> | null;
+  events?: Array<{
+    id?: string;
+    endDate?: string;
+    slug?: string;
+    url?: string | null;
+    marketUrl?: string | null;
+    category?: string | null;
+    tags?: Array<{ label?: string; slug?: string } | string> | null;
+  }> | null;
   eventSlug?: string | null;
   conditionId?: string | null;
   groupItemTitle?: string | null;
@@ -33,6 +46,10 @@ export interface ShortlistMarket {
   volume: number;
   startDate: Date | null;
   category: string | null;
+  /** Raw category string from Gamma (before standardisation); used for Gemini `existing_category`. */
+  categoryFromApiRaw?: string | null;
+  /** From Gemini batch (geography); not from Polymarket API. */
+  marketGeography: string | null;
   days_to_resolution: number | null;
   time_bucket: string;
   marketUrl: string | null;

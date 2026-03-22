@@ -1,5 +1,10 @@
 import { GammaMarket, ShortlistMarket } from "./types";
 import { getTimeBucket, type TimeBucket } from "../markets/timeBuckets";
+import { resolvePolymarketUrlFromGammaMarket } from "./marketUrl";
+import {
+  extractRawCategoryFromGammaMarket,
+  mapToStandardCategory
+} from "./categoryAndGeography";
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
@@ -141,6 +146,7 @@ export async function buildSlotShortlist(
     volume: number;
     startDate: Date | null;
     category: string | null;
+    categoryRaw: string | null;
     description: string | null;
   }> = [];
 
@@ -161,11 +167,9 @@ export async function buildSlotShortlist(
     }
 
     const startDate = m.startDate ? new Date(m.startDate) : null;
-    const category =
-      m.category ??
-      (m.tags?.[0] as { label?: string } | undefined)?.label ??
-      (m.tags?.[0] as { slug?: string } | undefined)?.slug ??
-      null;
+    const categoryRaw = extractRawCategoryFromGammaMarket(m);
+    const categoryStd = mapToStandardCategory(categoryRaw);
+    const category = categoryStd ?? categoryRaw ?? null;
 
     if (existingSet.has(m.id) || excludedSet.has(m.id)) continue;
 
@@ -176,35 +180,17 @@ export async function buildSlotShortlist(
       volume,
       startDate,
       category,
+      categoryRaw,
       description: m.description ?? null
     });
   }
 
   const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const toShortlist = (item: (typeof filtered)[0]): ShortlistMarket => {
+  const toShortlist = async (item: (typeof filtered)[0]): Promise<ShortlistMarket> => {
     const { daysToResolution, timeBucket } = getTimeBucket(now, item.resolutionDate);
-    const marketSlug = (item.m as { slug?: string | null }).slug ?? null;
-    const eventSlug =
-      (item.m as {
-        eventSlug?: string | null;
-        events?: Array<{ slug?: string | null }>;
-      }).eventSlug ??
-      (item.m as { events?: Array<{ slug?: string | null }> }).events?.[0]?.slug ??
-      null;
-    const safeMarketSlug =
-      typeof marketSlug === "string" && marketSlug.trim().length > 0
-        ? encodeURIComponent(marketSlug.trim())
-        : null;
-    const safeEventSlug =
-      typeof eventSlug === "string" && eventSlug.trim().length > 0
-        ? encodeURIComponent(eventSlug.trim())
-        : null;
-    const marketUrl =
-      safeEventSlug && safeMarketSlug
-        ? `https://polymarket.com/event/${safeEventSlug}/${safeMarketSlug}`
-        : safeMarketSlug
-          ? `https://polymarket.com/event/${safeMarketSlug}`
-          : null;
+    const marketUrl = await resolvePolymarketUrlFromGammaMarket(item.m, {
+      polymarketId: item.m.id
+    });
     return {
       polymarketId: item.m.id,
       title: item.m.question ?? "Untitled",
@@ -213,7 +199,9 @@ export async function buildSlotShortlist(
       crowd_price: Math.round(item.yesPrice * 100),
       volume: item.volume,
       startDate: item.startDate,
-      category: item.category,
+      category: mapToStandardCategory(item.categoryRaw) ?? null,
+      categoryFromApiRaw: item.categoryRaw,
+      marketGeography: null,
       days_to_resolution: daysToResolution,
       time_bucket: timeBucket,
       marketUrl,
@@ -248,18 +236,18 @@ export async function buildSlotShortlist(
   const categorySorted = [...categoryByRarity.values()].sort((a, b) => b.volume - a.volume);
 
   const byId = new Map<string, ShortlistMarket>();
-  const add = (item: (typeof filtered)[0]) => {
+  const add = async (item: (typeof filtered)[0]) => {
     if (byId.size >= 20) return;
-    if (!byId.has(item.m.id)) byId.set(item.m.id, toShortlist(item));
+    if (!byId.has(item.m.id)) byId.set(item.m.id, await toShortlist(item));
   };
 
-  for (let i = 0; i < 4 && i < byVolume.length; i++) add(byVolume[i]);
-  for (let i = 0; i < 4 && i < momentumSorted.length; i++) add(momentumSorted[i]);
-  for (let i = 0; i < 4 && i < newestSorted.length; i++) add(newestSorted[i]);
-  for (let i = 0; i < 4 && i < categorySorted.length; i++) add(categorySorted[i]);
+  for (let i = 0; i < 4 && i < byVolume.length; i++) await add(byVolume[i]);
+  for (let i = 0; i < 4 && i < momentumSorted.length; i++) await add(momentumSorted[i]);
+  for (let i = 0; i < 4 && i < newestSorted.length; i++) await add(newestSorted[i]);
+  for (let i = 0; i < 4 && i < categorySorted.length; i++) await add(categorySorted[i]);
   for (const f of byVolume) {
     if (byId.size >= 20) break;
-    add(f);
+    await add(f);
   }
 
   const markets = [...byId.values()].slice(0, 20);

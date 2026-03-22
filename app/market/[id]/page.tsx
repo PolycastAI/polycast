@@ -50,8 +50,7 @@ export default async function MarketPage({ params }: MarketPageProps) {
     ? new Date(resolutionDate).toLocaleString()
     : "TBD";
 
-  const marketUrl =
-    market.market_url ?? `https://polymarket.com/market/${market.polymarket_id}`;
+  const polymarketUrl = market.market_url as string | null;
   const socialTitle =
     market.social_title && market.social_title.length > 0
       ? market.social_title
@@ -75,15 +74,19 @@ export default async function MarketPage({ params }: MarketPageProps) {
               {market.category ?? "Uncategorized"}
             </span>
           </p>
-          <a
-            href={marketUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-1 inline-flex items-center text-xs font-medium text-emerald-400 hover:text-emerald-300"
-          >
-            View on Polymarket
-            <span className="ml-1 text-[10px]">↗</span>
-          </a>
+          {polymarketUrl ? (
+            <a
+              href={polymarketUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-1 inline-flex items-center text-xs font-medium text-emerald-400 hover:text-emerald-300"
+            >
+              View on Polymarket
+              <span className="ml-1 text-[10px]">↗</span>
+            </a>
+          ) : (
+            <p className="mt-1 text-xs text-slate-500">URL not available</p>
+          )}
         </div>
         <div className="flex items-center gap-3">
           <XCopyButton

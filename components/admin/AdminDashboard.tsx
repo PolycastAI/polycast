@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { buildTwitterIntentUrl } from "@/lib/social/twitterIntent";
 
 interface AdminMarket {
   id: string;
@@ -8,6 +9,7 @@ interface AdminMarket {
   title: string;
   social_title: string | null;
   category: string | null;
+  market_geography: string | null;
   resolution_date: string | null;
   market_url: string | null;
   status: string | null;
@@ -249,7 +251,7 @@ export function AdminDashboard({
           (body as { error?: string }).error ?? res.statusText ?? "send failed"
         );
       }
-      setPipelineMessage("Sent. Refreshing…");
+      setPipelineMessage("Sent to Bluesky. Refreshing…");
       setTimeout(() => window.location.reload(), 1200);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -393,6 +395,12 @@ export function AdminDashboard({
                     <span className="font-medium text-slate-300">Category:</span>{" "}
                     {m.category ?? "Uncategorized"}
                   </p>
+                  {m.market_geography != null && m.market_geography !== "" && (
+                    <p className="text-xs text-slate-400">
+                      <span className="font-medium text-slate-300">Geography:</span>{" "}
+                      {m.market_geography}
+                    </p>
+                  )}
                   <p className="text-xs text-slate-400">
                     <span className="font-medium text-slate-300">Crowd price:</span>{" "}
                     {m.current_price != null
@@ -427,7 +435,7 @@ export function AdminDashboard({
                       </p>
                     </div>
                   )}
-                  {m.market_url && (
+                  {m.market_url ? (
                     <a
                       href={m.market_url}
                       target="_blank"
@@ -436,6 +444,8 @@ export function AdminDashboard({
                     >
                       View on Polymarket ↗
                     </a>
+                  ) : (
+                    <span className="text-xs text-slate-500">URL not available</span>
                   )}
                 </div>
                 <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -512,6 +522,12 @@ export function AdminDashboard({
                     <span className="font-medium text-slate-300">Category:</span>{" "}
                     {m.category ?? "Uncategorized"}
                   </p>
+                  {m.market_geography != null && m.market_geography !== "" && (
+                    <p className="text-xs text-slate-400">
+                      <span className="font-medium text-slate-300">Geography:</span>{" "}
+                      {m.market_geography}
+                    </p>
+                  )}
                   <p className="text-xs text-slate-400">
                     <span className="font-medium text-slate-300">Crowd price:</span>{" "}
                     {m.current_price != null
@@ -553,7 +569,7 @@ export function AdminDashboard({
                     </div>
                   )}
 
-                  {m.market_url && (
+                  {m.market_url ? (
                     <a
                       href={m.market_url}
                       target="_blank"
@@ -562,6 +578,8 @@ export function AdminDashboard({
                     >
                       View on Polymarket ↗
                     </a>
+                  ) : (
+                    <span className="text-xs text-slate-500">URL not available</span>
                   )}
                 </div>
 
@@ -669,6 +687,12 @@ export function AdminDashboard({
                     <span className="font-medium text-slate-300">Category:</span>{" "}
                     {m.category ?? "Uncategorized"}
                   </p>
+                  {m.market_geography != null && m.market_geography !== "" && (
+                    <p className="text-xs text-slate-400">
+                      <span className="font-medium text-slate-300">Geography:</span>{" "}
+                      {m.market_geography}
+                    </p>
+                  )}
                   <p className="text-xs text-slate-400">
                     <span className="font-medium text-slate-300">Crowd price:</span>{" "}
                     {m.current_price != null
@@ -709,7 +733,7 @@ export function AdminDashboard({
                     </div>
                   )}
 
-                  {m.market_url && (
+                  {m.market_url ? (
                     <a
                       href={m.market_url}
                       target="_blank"
@@ -718,6 +742,8 @@ export function AdminDashboard({
                     >
                       View on Polymarket ↗
                     </a>
+                  ) : (
+                    <span className="text-xs text-slate-500">URL not available</span>
                   )}
                 </div>
               </div>
@@ -729,10 +755,17 @@ export function AdminDashboard({
 
       {activeSection === "blueskyPending" && (
       <section>
-        <h2 className="mb-3 mt-8 text-lg font-semibold text-slate-100">
+        <h2 className="mb-2 mt-8 text-lg font-semibold text-slate-100">
           Bluesky pending posts ({blueskyPendingPosts.length})
         </h2>
-        <div className="mb-3 flex items-center gap-3">
+        <p className="mb-4 max-w-3xl text-sm text-slate-400">
+          Copy is queued as <code className="text-slate-300">pending</code> when the pipeline runs. Use{" "}
+          <strong className="text-slate-200">Send</strong> / <strong className="text-slate-200">Send All Pending</strong>{" "}
+          to post to Bluesky (server needs <code className="text-slate-300">BLUESKY_*</code>).{" "}
+          <strong className="text-slate-200">Post on X</strong> is optional—opens X with the text pre-filled. Nothing
+          auto-posts from crons.
+        </p>
+        <div className="mb-4 flex items-center gap-3">
           <button
             type="button"
             onClick={sendAllBlueskyPendingPosts}
@@ -744,7 +777,7 @@ export function AdminDashboard({
         </div>
         {blueskyPendingPosts.length === 0 ? (
           <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">
-            No Bluesky posts awaiting posting (all are marked `posted`).
+            No queued posts. When predictions or resolution copy is generated, it will appear here.
           </p>
         ) : (
           <div className="grid gap-4 md:grid-cols-2">
@@ -776,7 +809,7 @@ export function AdminDashboard({
 
                   <div className="rounded border border-slate-700 bg-slate-900/50 p-2">
                     <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
-                      Bluesky post text
+                      Post text
                     </p>
                     <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap text-xs text-slate-200">
                       {p.post_text}
@@ -795,24 +828,38 @@ export function AdminDashboard({
                   )}
                 </div>
 
-                {p.market_url && (
-                  <a
-                    href={p.market_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-3 inline-flex text-xs font-medium text-emerald-400 hover:text-emerald-300"
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => sendSingleBlueskyPost(p.id)}
+                    disabled={busyId === p.id}
+                    className="rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 shadow hover:bg-emerald-400 disabled:opacity-60"
                   >
-                    View on Polymarket ↗
+                    Send
+                  </button>
+                  <a
+                    href={buildTwitterIntentUrl(
+                      typeof p.post_text === "string" ? p.post_text : ""
+                    )}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex rounded-full bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white shadow hover:bg-sky-500"
+                  >
+                    Post on X
                   </a>
-                )}
-
-                <button
-                  onClick={() => sendSingleBlueskyPost(p.id)}
-                  disabled={busyId === p.id}
-                  className="mt-3 rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 shadow hover:bg-emerald-400 disabled:opacity-60"
-                >
-                  Send
-                </button>
+                  {p.market_url ? (
+                    <a
+                      href={p.market_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex text-xs font-medium text-emerald-400 hover:text-emerald-300"
+                    >
+                      Polymarket ↗
+                    </a>
+                  ) : (
+                    <span className="text-xs text-slate-500">URL not available</span>
+                  )}
+                </div>
               </div>
             ))}
           </div>
@@ -825,9 +872,12 @@ export function AdminDashboard({
         <h2 className="mb-3 mt-10 text-lg font-semibold text-slate-100">
           Bluesky sent posts ({blueskySentPosts.length})
         </h2>
+        <p className="mb-4 text-sm text-slate-500">
+          Posts successfully sent via the Bluesky API from this admin panel.
+        </p>
         {blueskySentPosts.length === 0 ? (
           <p className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-8 text-center text-slate-400">
-            No Bluesky posts have been sent yet.
+            No sent posts yet.
           </p>
         ) : (
           <div className="grid gap-4 md:grid-cols-2">

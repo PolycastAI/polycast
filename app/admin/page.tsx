@@ -3,6 +3,7 @@ import { AdminDashboard } from "@/components/admin/AdminDashboard";
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { getTimeBucket } from "@/lib/markets/timeBuckets";
 import { fetchMarketById } from "@/lib/polymarket/gamma";
+import { resolvePolymarketUrlFromGammaMarket } from "@/lib/polymarket/marketUrl";
 
 export const dynamic = "force-dynamic";
 
@@ -14,7 +15,7 @@ async function getAdminData() {
         supabaseAdmin
           .from("markets")
           .select(
-            "id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
+            "id, polymarket_id, title, social_title, category, market_geography, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
           )
           .eq("status", "pending")
           .order("created_at", { ascending: false }),
@@ -27,7 +28,7 @@ async function getAdminData() {
     const { data: approvedRows, error: approvedError } = await supabaseAdmin
       .from("markets")
       .select(
-        "id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
+        "id, polymarket_id, title, social_title, category, market_geography, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
       )
       .in("status", ["approved", "active"])
       .order("created_at", { ascending: false });
@@ -35,7 +36,7 @@ async function getAdminData() {
     const { data: resolvedRows, error: resolvedError } = await supabaseAdmin
       .from("markets")
       .select(
-        "id, polymarket_id, title, social_title, category, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
+        "id, polymarket_id, title, social_title, category, market_geography, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
       )
       .eq("status", "resolved")
       .order("created_at", { ascending: false });
@@ -225,33 +226,20 @@ async function getAdminData() {
       }
     }
 
-    // Ensure "View on Polymarket" URLs are real/active:
-    // If DB contains the old broken fallback (`/market/{id}`), replace with event-slug URL.
+    // Backfill display-only when DB has no URL or legacy `/market/{id}` placeholder — use Gamma API fields only.
     const maybeFixMarketUrl = async (m: any) => {
       const pmId = m?.polymarket_id;
+      if (!pmId) return;
       const existing = m?.market_url as string | null;
       const needsFix =
-        !existing ||
+        existing == null ||
+        existing === "" ||
         (typeof existing === "string" && existing.includes("polymarket.com/market/"));
-      if (!pmId || !needsFix) return;
+      if (!needsFix) return;
 
       const gamma = await fetchMarketById(pmId);
-      const marketSlug = (gamma as any)?.slug ?? null;
-      const eventSlug = (gamma as any)?.eventSlug ?? (gamma as any)?.events?.[0]?.slug ?? null;
-      const safeMarketSlug =
-        typeof marketSlug === "string" && marketSlug.trim().length > 0
-          ? encodeURIComponent(marketSlug.trim())
-          : null;
-      const safeEventSlug =
-        typeof eventSlug === "string" && eventSlug.trim().length > 0
-          ? encodeURIComponent(eventSlug.trim())
-          : null;
-      m.market_url =
-        safeEventSlug && safeMarketSlug
-          ? `https://polymarket.com/event/${safeEventSlug}/${safeMarketSlug}`
-          : safeMarketSlug
-            ? `https://polymarket.com/event/${safeMarketSlug}`
-            : null;
+      if (!gamma) return;
+      m.market_url = await resolvePolymarketUrlFromGammaMarket(gamma, { polymarketId: pmId });
     };
 
     await Promise.all([...pending, ...approved, ...resolved].map(maybeFixMarketUrl));

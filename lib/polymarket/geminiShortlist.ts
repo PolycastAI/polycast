@@ -3,9 +3,16 @@
  * prompt Gemini for 20 selections, fetch full details for description, dedup, return ShortlistMarket[].
  */
 
+import { parseGeminiJsonArray } from "@/lib/ai/geminiJson";
 import { getTimeBucket } from "@/lib/markets/timeBuckets";
 import type { ShortlistMarket, GammaMarket } from "./types";
 import { fetchMarketById } from "./gamma";
+import { resolvePolymarketUrlFromGammaMarket } from "./marketUrl";
+import {
+  extractRawCategoryFromGammaMarket,
+  mapToStandardCategory,
+  enrichShortlistWithGeminiGeographyAndCategories
+} from "./categoryAndGeography";
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
@@ -108,57 +115,6 @@ function stripMarkets(raw: GammaMarket[]): StrippedMarket[] {
   return out;
 }
 
-/**
- * Parse Gemini's response into a JSON array. Handles markdown fences, leading/trailing text,
- * and truncated or slightly malformed JSON (e.g. unterminated string at end).
- */
-function parseGeminiJsonArray(raw: string): unknown[] {
-  let text = raw.replace(/```json?\s*/i, "").replace(/```\s*$/, "").trim();
-  // Remove control characters that can break JSON (e.g. U+2028 line separator)
-  text = text.replace(/[\u0000-\u001F\u2028\u2029]/g, (m) => (m === "\n" || m === "\r" || m === "\t" ? m : " "));
-  const firstBracket = text.indexOf("[");
-  if (firstBracket === -1) return [];
-  text = text.slice(firstBracket);
-  const lastBracket = text.lastIndexOf("]");
-  if (lastBracket !== -1) text = text.slice(0, lastBracket + 1);
-
-  const tryParse = (str: string): unknown[] | null => {
-    try {
-      const out = JSON.parse(str);
-      return Array.isArray(out) ? out : [];
-    } catch {
-      return null;
-    }
-  };
-
-  let result = tryParse(text);
-  if (result != null) return result;
-
-  // Fix unescaped newlines in response (common cause of "Unterminated string")
-  const noNewlines = text.replace(/\r\n/g, " ").replace(/\n/g, " ").replace(/\r/g, " ");
-  result = tryParse(noNewlines);
-  if (result != null) return result;
-
-  // Truncate at last complete object boundary to recover partial array
-  for (let i = text.length - 1; i > 0; i--) {
-    if (text[i] === "}" && (text[i + 1] === "," || text[i + 1] === "]")) {
-      const truncated = text.slice(0, i + 1) + "]";
-      result = tryParse(truncated);
-      if (result != null) return result;
-    }
-  }
-  for (let i = text.length - 1; i > 0; i--) {
-    if (text[i] === "}") {
-      const truncated = text.slice(0, i + 1) + "]";
-      result = tryParse(truncated);
-      if (result != null) return result;
-    }
-  }
-
-  console.warn("[geminiShortlist] Could not parse Gemini JSON; raw slice:", text.slice(0, 800));
-  return [];
-}
-
 /** Call Gemini for N selections from the given list. Returns array of { id, question, crowd_price, endDate, volume }. */
 async function callGeminiForSelection(
   strippedList: StrippedMarket[],
@@ -245,7 +201,6 @@ export async function buildGeminiShortlist(
 
   const raw = await fetchRawMarkets();
   const stripped = stripMarkets(raw);
-  const slugById = new Map<string, string | null>(stripped.map((s) => [s.id, s.slug ?? null]));
   const pool = stripped.filter((s) => !existingSet.has(s.id) && !excludedSet.has(s.id));
 
   let selected: { id: string; question: string; crowd_price: number; endDate: string; volume: number }[] = [];
@@ -281,31 +236,12 @@ export async function buildGeminiShortlist(
     const resolutionDate = sel.endDate ? new Date(sel.endDate) : null;
     if (!resolutionDate || isNaN(resolutionDate.getTime())) continue;
     const { daysToResolution, timeBucket } = getTimeBucket(now, resolutionDate);
-    const marketSlug =
-      (full as { slug?: string | null } | null)?.slug ??
-      slugById.get(sel.id) ??
-      null;
-    const eventSlug =
-      (full as { eventSlug?: string | null; events?: Array<{ slug?: string | null }> } | null)
-        ?.eventSlug ??
-      (full as { events?: Array<{ slug?: string | null }> } | null)?.events?.[0]?.slug ??
-      null;
-    const safeMarketSlug =
-      typeof marketSlug === "string" && marketSlug.trim().length > 0
-        ? encodeURIComponent(marketSlug.trim())
-        : null;
-    const safeEventSlug =
-      typeof eventSlug === "string" && eventSlug.trim().length > 0
-        ? encodeURIComponent(eventSlug.trim())
-        : null;
-    const marketUrl =
-      safeEventSlug && safeMarketSlug
-        ? `https://polymarket.com/event/${safeEventSlug}/${safeMarketSlug}`
-        : safeMarketSlug
-          ? `https://polymarket.com/event/${safeMarketSlug}`
-          : null;
+    const marketUrl = full
+      ? await resolvePolymarketUrlFromGammaMarket(full, { polymarketId: sel.id })
+      : null;
     const description = full?.description ?? null;
-    const category = full?.category ?? null;
+    const categoryRaw = extractRawCategoryFromGammaMarket(full);
+    const category = mapToStandardCategory(categoryRaw) ?? null;
 
     markets.push({
       polymarketId: sel.id,
@@ -316,6 +252,8 @@ export async function buildGeminiShortlist(
       volume: sel.volume,
       startDate: null,
       category,
+      categoryFromApiRaw: categoryRaw,
+      marketGeography: null,
       days_to_resolution: daysToResolution,
       time_bucket: timeBucket,
       marketUrl,
@@ -324,6 +262,8 @@ export async function buildGeminiShortlist(
       timeBucket
     });
   }
+
+  await enrichShortlistWithGeminiGeographyAndCategories(markets);
 
   return {
     markets,

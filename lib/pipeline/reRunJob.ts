@@ -2,6 +2,7 @@
 
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { fetchMarketById } from "@/lib/polymarket/gamma";
+import { resolvePolymarketUrlFromGammaMarket } from "@/lib/polymarket/marketUrl";
 import { renderPromptV1, PROMPT_VERSION } from "@/lib/ai/promptV1";
 import { callModelWithRetry, ModelName } from "@/lib/ai/models";
 import {
@@ -163,22 +164,16 @@ export async function runReRunJob() {
     }
 
     if (changes.length > 0) {
+      const resolvedUrl =
+        market.market_url ??
+        (await resolvePolymarketUrlFromGammaMarket(gamma, {
+          polymarketId: market.polymarket_id
+        }));
       await postReRunUpdateToBluesky({
         marketId: market.id,
         socialTitle:
           (market.social_title || market.title) ?? "Market",
-        marketUrl:
-          market.market_url ??
-          ((() => {
-            const slug = (gamma as any)?.slug;
-            const safeSlug =
-              typeof slug === "string" && slug.trim().length > 0
-                ? encodeURIComponent(slug.trim())
-                : null;
-            return safeSlug
-              ? `https://polymarket.com/event/${safeSlug}`
-              : "https://polymarket.com/markets";
-          })() as string),
+        marketUrl: resolvedUrl,
         changes
       });
     }

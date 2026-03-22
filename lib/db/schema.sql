@@ -207,6 +207,7 @@ begin
     polymarket_id,
     title,
     category,
+    market_geography,
     resolution_date,
     resolution_criteria,
     market_url,
@@ -218,6 +219,7 @@ begin
     (m->>'polymarket_id')::text,
     m->>'title',
     nullif(m->>'category', '')::text,
+    nullif(m->>'market_geography', '')::text,
     case
       when m ? 'resolution_date' and m->>'resolution_date' is not null and m->>'resolution_date' <> ''
       then (m->>'resolution_date')::timestamptz

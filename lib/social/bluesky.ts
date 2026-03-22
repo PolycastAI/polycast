@@ -132,8 +132,11 @@ export async function postPredictionToBluesky(args: {
     );
   }
 
-  // Use the live Polymarket URL so users can click through to current odds.
-  lines.push(marketUrl ?? "https://polymarket.com/markets");
+  if (marketUrl) {
+    lines.push(marketUrl);
+  } else {
+    lines.push("URL not available");
+  }
 
   const text = lines.join("\n");
 
@@ -160,7 +163,7 @@ export async function postResolutionToBluesky(args: {
   socialTitle: string;
   outcome: boolean; // true = YES
   modelPnls: ResolutionModelPnl[];
-  marketUrl: string;
+  marketUrl: string | null;
   includeCumulative?: boolean;
 }): Promise<string | null> {
   const lines: string[] = [];
@@ -190,7 +193,11 @@ export async function postResolutionToBluesky(args: {
       .join(", ");
     lines.push(`Cumulative: ${cum}`);
   }
-  lines.push(args.marketUrl);
+  if (args.marketUrl) {
+    lines.push(args.marketUrl);
+  } else {
+    lines.push("URL not available");
+  }
 
   const record = {
     $type: "app.bsky.feed.post",
@@ -220,7 +227,7 @@ export interface ReRunChange {
 export async function postReRunUpdateToBluesky(args: {
   marketId: string;
   socialTitle: string;
-  marketUrl: string;
+  marketUrl: string | null;
   changes: ReRunChange[];
 }): Promise<string | null> {
   const lines: string[] = [];
@@ -232,7 +239,11 @@ export async function postReRunUpdateToBluesky(args: {
     );
   }
   if (lines.length <= 1) return null;
-  lines.push(args.marketUrl);
+  if (args.marketUrl) {
+    lines.push(args.marketUrl);
+  } else {
+    lines.push("URL not available");
+  }
 
   const record = {
     $type: "app.bsky.feed.post",
@@ -346,7 +357,6 @@ export async function sendQueuedBlueskyPostById(
   if (!row) return null;
 
   if (row.id !== socialPostId) return null;
-  // Only send pending posts.
   if (row.status && row.status !== "pending") return null;
 
   try {
