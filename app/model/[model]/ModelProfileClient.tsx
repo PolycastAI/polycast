@@ -63,6 +63,20 @@ function formatShortDate(iso: string): string {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+/** When two ticks fall on the same calendar day, add time so labels don’t duplicate. */
+function formatXAxisLabel(iso: string, prevIso: string | null): string {
+  const day = formatShortDate(iso);
+  if (!prevIso || formatShortDate(prevIso) !== day) return day;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return day;
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+}
+
 /** ~4–5 evenly spaced Y ticks including min/max domain used for scaling. */
 function buildYTicks(rangeMin: number, rangeMax: number, count = 5): number[] {
   const span = rangeMax - rangeMin;
@@ -89,6 +103,47 @@ function EquityChart({
     return history.filter((h) => toDateValue(h.recorded_at) >= minTs);
   }, [history, windowKey]);
 
+  /**
+   * All-time: prepend $0 the day before the first resolution (true cumulative baseline).
+   * 7d / 30d: prepend $0 at the window start and rebase so the first in-window point is $0
+   * (P&amp;L change over the period — chart always starts at zero on the left).
+   */
+  const series = useMemo(() => {
+    if (filtered.length === 0) return [];
+
+    if (windowKey === "all-time") {
+      const first = filtered[0];
+      const t0 = toDateValue(first.recorded_at);
+      const originTs = t0 > 0 ? t0 - 24 * 60 * 60 * 1000 : Date.now() - 24 * 60 * 60 * 1000;
+      const origin: ModelPageHistory = {
+        recorded_at: new Date(originTs).toISOString(),
+        cumulative_pnl: 0,
+        bet_pnl: null,
+        resolved_market_id: null
+      };
+      return [origin, ...filtered];
+    }
+
+    const now = Date.now();
+    const days = windowKey === "7d" ? 7 : 30;
+    const windowStartTs = now - days * 24 * 60 * 60 * 1000;
+    const baseline = Number(filtered[0]?.cumulative_pnl ?? 0);
+
+    const origin: ModelPageHistory = {
+      recorded_at: new Date(windowStartTs).toISOString(),
+      cumulative_pnl: 0,
+      bet_pnl: null,
+      resolved_market_id: null
+    };
+
+    const rebased: ModelPageHistory[] = filtered.map((h) => ({
+      ...h,
+      cumulative_pnl: Number(h.cumulative_pnl ?? 0) - baseline
+    }));
+
+    return [origin, ...rebased];
+  }, [filtered, windowKey]);
+
   const chartGeom = useMemo(() => {
     const W = 720;
     const H = 300;
@@ -99,15 +154,17 @@ function EquityChart({
   }, []);
 
   const layout = useMemo(() => {
-    if (filtered.length === 0) return null;
+    if (series.length === 0) return null;
 
-    const vals = filtered.map((h) => Number(h.cumulative_pnl ?? 0));
+    const vals = series.map((h) => Number(h.cumulative_pnl ?? 0));
     const dataMin = Math.min(...vals);
     const dataMax = Math.max(...vals);
     const spread = dataMax - dataMin;
     const padY = Math.max(spread * 0.12, 25);
     let rangeMin = dataMin - padY;
     let rangeMax = dataMax + padY;
+    rangeMin = Math.min(0, rangeMin);
+    rangeMax = Math.max(0, rangeMax);
     if (rangeMax - rangeMin < 1) {
       rangeMin -= 50;
       rangeMax += 50;
@@ -116,7 +173,7 @@ function EquityChart({
 
     const yTicks = buildYTicks(rangeMin, rangeMax, 5);
 
-    const n = filtered.length;
+    const n = series.length;
     const xAt = (i: number) =>
       chartGeom.pad.left + (n <= 1 ? chartGeom.innerW / 2 : (i / (n - 1)) * chartGeom.innerW);
     const yAt = (v: number) =>
@@ -124,12 +181,12 @@ function EquityChart({
       chartGeom.innerH -
       ((v - rangeMin) / ySpan) * chartGeom.innerH;
 
-    const linePoints = filtered.map((h, i) => ({
+    const linePoints = series.map((h, i) => ({
       x: xAt(i),
       y: yAt(Number(h.cumulative_pnl ?? 0))
     }));
 
-    const last = Number(filtered[filtered.length - 1]?.cumulative_pnl ?? 0);
+    const last = Number(series[series.length - 1]?.cumulative_pnl ?? 0);
     const lineColor = last >= 0 ? "#22c55e" : "#f43f5e";
 
     const zeroY =
@@ -142,10 +199,13 @@ function EquityChart({
           ? [0, 1]
           : [0, Math.floor((n - 1) / 2), n - 1];
 
-    const xLabels = xLabelIndices.map((i) => ({
-      x: xAt(i),
-      label: formatShortDate(filtered[i].recorded_at)
-    }));
+    const xLabels = xLabelIndices.map((i) => {
+      const prevIso = i > 0 ? series[i - 1].recorded_at : null;
+      return {
+        x: xAt(i),
+        label: formatXAxisLabel(series[i].recorded_at, prevIso)
+      };
+    });
 
     return {
       ...chartGeom,
@@ -158,7 +218,7 @@ function EquityChart({
       zeroY,
       xLabels
     };
-  }, [filtered, chartGeom]);
+  }, [series, chartGeom]);
 
   if (filtered.length === 0) {
     return (
@@ -176,7 +236,9 @@ function EquityChart({
   return (
     <div className="space-y-2">
       <p className="text-center text-[11px] font-medium uppercase tracking-wide text-slate-500">
-        Cumulative P&amp;L (USD)
+        {windowKey === "all-time"
+          ? "Cumulative P&L (USD)"
+          : `P&L over this ${windowKey === "7d" ? "7 days" : "30 days"} — starts at $0 (USD)`}
       </p>
       <div className="w-full overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/80">
         <svg
@@ -184,7 +246,11 @@ function EquityChart({
           className="min-h-[260px] w-full min-w-[320px]"
           preserveAspectRatio="xMidYMid meet"
           role="img"
-          aria-label="Equity curve: cumulative profit and loss over time"
+          aria-label={
+            windowKey === "all-time"
+              ? "Equity curve: cumulative profit and loss over time"
+              : "Equity curve: profit and loss over the selected period, starting from zero"
+          }
         >
           {/* Plot border */}
           <rect
