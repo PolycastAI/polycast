@@ -69,15 +69,16 @@ function formatXAxisLabel(iso: string, prevIso: string | null): string {
   if (!prevIso || formatShortDate(prevIso) !== day) return day;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return day;
-  return d.toLocaleString(undefined, {
+  return d.toLocaleString("en-US", {
     month: "short",
     day: "numeric",
     hour: "numeric",
-    minute: "2-digit"
+    minute: "2-digit",
+    hour12: true
   });
 }
 
-/** ~4–5 evenly spaced Y ticks including min/max domain used for scaling. */
+/** ~4–5 evenly spaced Y ticks on [rangeMin, rangeMax]. */
 function buildYTicks(rangeMin: number, rangeMax: number, count = 5): number[] {
   const span = rangeMax - rangeMin;
   if (span <= 0) {
@@ -88,6 +89,15 @@ function buildYTicks(rangeMin: number, rangeMax: number, count = 5): number[] {
   return Array.from({ length: count }, (_, i) => rangeMin + step * i);
 }
 
+/** Include a $0 tick whenever zero is in range (so the baseline is labeled). */
+function mergeYTicksWithZero(rangeMin: number, rangeMax: number): number[] {
+  const base = buildYTicks(rangeMin, rangeMax, 5);
+  const set = new Set<number>();
+  for (const t of base) set.add(Math.round(t));
+  if (rangeMin <= 0 && rangeMax >= 0) set.add(0);
+  return Array.from(set).sort((a, b) => a - b);
+}
+
 function EquityChart({
   history,
   windowKey
@@ -95,13 +105,22 @@ function EquityChart({
   history: ModelPageHistory[];
   windowKey: WindowKey;
 }) {
+  /** Oldest → newest (defensive; API order should already be ascending). */
+  const sortedHistory = useMemo(
+    () =>
+      [...history].sort(
+        (a, b) => toDateValue(a.recorded_at) - toDateValue(b.recorded_at)
+      ),
+    [history]
+  );
+
   const filtered = useMemo(() => {
-    if (windowKey === "all-time") return history;
+    if (windowKey === "all-time") return sortedHistory;
     const now = Date.now();
     const days = windowKey === "7d" ? 7 : 30;
     const minTs = now - days * 24 * 60 * 60 * 1000;
-    return history.filter((h) => toDateValue(h.recorded_at) >= minTs);
-  }, [history, windowKey]);
+    return sortedHistory.filter((h) => toDateValue(h.recorded_at) >= minTs);
+  }, [sortedHistory, windowKey]);
 
   /**
    * All-time: prepend $0 the day before the first resolution (true cumulative baseline).
@@ -163,19 +182,35 @@ function EquityChart({
     const padY = Math.max(spread * 0.12, 25);
     let rangeMin = dataMin - padY;
     let rangeMax = dataMax + padY;
+    /**
+     * Don’t add “air” above $0 when the curve never goes positive — that pushed $0
+     * to the top of the chart and made the start look like a gain.
+     */
+    if (dataMax <= 0) rangeMax = dataMax;
     rangeMin = Math.min(0, rangeMin);
     rangeMax = Math.max(0, rangeMax);
     if (rangeMax - rangeMin < 1) {
       rangeMin -= 50;
       rangeMax += 50;
     }
-    const ySpan = rangeMax - rangeMin;
+    const ySpan = Math.max(rangeMax - rangeMin, 1e-9);
 
-    const yTicks = buildYTicks(rangeMin, rangeMax, 5);
+    const yTicks = mergeYTicksWithZero(rangeMin, rangeMax);
+
+    const times = series.map((h) => toDateValue(h.recorded_at));
+    const tMin = Math.min(...times);
+    const tMax = Math.max(...times);
+    const spanT = Math.max(tMax - tMin, 1);
 
     const n = series.length;
-    const xAt = (i: number) =>
-      chartGeom.pad.left + (n <= 1 ? chartGeom.innerW / 2 : (i / (n - 1)) * chartGeom.innerW);
+    const xAt = (i: number) => {
+      if (n <= 1) return chartGeom.pad.left + chartGeom.innerW / 2;
+      const t = times[i];
+      if (!Number.isFinite(t) || tMax <= tMin) {
+        return chartGeom.pad.left + (i / Math.max(n - 1, 1)) * chartGeom.innerW;
+      }
+      return chartGeom.pad.left + ((t - tMin) / spanT) * chartGeom.innerW;
+    };
     const yAt = (v: number) =>
       chartGeom.pad.top +
       chartGeom.innerH -
@@ -263,26 +298,29 @@ function EquityChart({
             strokeWidth={1}
           />
 
-          {/* Y grid + labels */}
-          {yTicks.map((tick) => {
+          {/* Y grid + labels ($0 label only here; baseline drawn below) */}
+          {yTicks.map((tick, ti) => {
             const y = yAt(tick);
+            const isZero = Math.abs(tick) < 0.5;
             return (
-              <g key={tick}>
-                <line
-                  x1={pad.left}
-                  x2={pad.left + innerW}
-                  y1={y}
-                  y2={y}
-                  stroke="#1e293b"
-                  strokeWidth={1}
-                  strokeDasharray="4 4"
-                />
+              <g key={`y-${ti}-${tick}`}>
+                {!isZero ? (
+                  <line
+                    x1={pad.left}
+                    x2={pad.left + innerW}
+                    y1={y}
+                    y2={y}
+                    stroke="#1e293b"
+                    strokeWidth={1}
+                    strokeDasharray="4 4"
+                  />
+                ) : null}
                 <text
                   x={pad.left - 8}
                   y={y + 4}
                   textAnchor="end"
-                  fill="#94a3b8"
-                  style={{ fontSize: 11 }}
+                  fill={isZero ? "#e2e8f0" : "#94a3b8"}
+                  style={{ fontSize: isZero ? 12 : 11, fontWeight: isZero ? 600 : 400 }}
                 >
                   {fmtAxisUsd(tick)}
                 </text>
@@ -300,15 +338,15 @@ function EquityChart({
             strokeWidth={1}
           />
 
-          {/* Zero line (P&amp;L = 0) when visible */}
+          {/* Zero baseline (P&amp;L = 0) when visible */}
           {zeroY != null && zeroY >= pad.top && zeroY <= pad.top + innerH ? (
             <line
               x1={pad.left}
               x2={pad.left + innerW}
               y1={zeroY}
               y2={zeroY}
-              stroke="#64748b"
-              strokeWidth={1}
+              stroke="#94a3b8"
+              strokeWidth={1.5}
             />
           ) : null}
 
