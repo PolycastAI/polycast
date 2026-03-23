@@ -1,184 +1,161 @@
+import { notFound } from "next/navigation";
 import { supabaseAdmin } from "@/lib/supabase/server";
+import { ModelProfileClient } from "./ModelProfileClient";
+import type {
+  ModelPageCategoryPerf,
+  ModelPageHistory,
+  ModelPagePerf,
+  ModelPagePrediction
+} from "./types";
+
+const MODEL_MAP = {
+  claude: "Claude",
+  chatgpt: "ChatGPT",
+  gemini: "Gemini",
+  grok: "Grok"
+} as const;
+
+type ModelSlug = keyof typeof MODEL_MAP;
 
 interface ModelPageProps {
   params: { model: string };
 }
 
-async function getModelData(modelName: string) {
-  const { data: perf, error: perfError } = await supabaseAdmin
-    .from("model_performance")
-    .select("model, total_pnl, wins, losses, brier_score")
-    .eq("model", modelName)
-    .is("time_bucket", null)
-    .maybeSingle();
+async function getModelPageData(modelName: string) {
+  const [{ data: perf }, { data: history }, { data: predictions }, { data: categoryPerf }] =
+    await Promise.all([
+      supabaseAdmin
+        .from("model_performance")
+        .select("total_pnl, wins, losses, brier_score")
+        .eq("model", modelName)
+        .is("category", null)
+        .is("time_bucket", null)
+        .maybeSingle(),
+      supabaseAdmin
+        .from("model_pnl_history")
+        .select("recorded_at, cumulative_pnl, bet_pnl, resolved_market_id")
+        .eq("model", modelName)
+        .order("recorded_at", { ascending: true })
+        .limit(5000),
+      supabaseAdmin
+        .from("predictions")
+        .select(
+          "id, market_id, model, model_version, predicted_at, resolution_date, days_to_resolution, time_bucket, blind_estimate, anchored_estimate, anchoring_delta, crowd_price_at_time, signal, resolved, outcome, pnl, markets(title, category, market_url, resolution_date)"
+        )
+        .eq("model", modelName)
+        .order("predicted_at", { ascending: false })
+        .limit(5000),
+      supabaseAdmin
+        .from("model_performance")
+        .select("category, total_bets, wins, losses, total_pnl")
+        .eq("model", modelName)
+        .not("category", "is", null)
+        .is("time_bucket", null)
+        .order("category", { ascending: true })
+    ]);
 
-  const { data: history, error: histError } = await supabaseAdmin
-    .from("model_pnl_history")
-    .select("recorded_at, cumulative_pnl, bet_pnl, resolved_market_id")
-    .eq("model", modelName)
-    .order("recorded_at", { ascending: true })
-    .limit(500);
+  const pendingMarketIds = new Set<string>();
+  for (const p of predictions ?? []) {
+    if (p?.resolved !== true && p?.market_id) pendingMarketIds.add(String(p.market_id));
+  }
+
+  let latestPriceByMarketId: Record<string, { current_price: number | null; recorded_at: string | null }> =
+    {};
+  if (pendingMarketIds.size > 0) {
+    const { data: prices } = await supabaseAdmin
+      .from("market_prices")
+      .select("market_id, current_price, recorded_at")
+      .in("market_id", Array.from(pendingMarketIds))
+      .order("recorded_at", { ascending: false })
+      .limit(10000);
+
+    const out: Record<string, { current_price: number | null; recorded_at: string | null }> = {};
+    for (const r of prices ?? []) {
+      const id = String(r.market_id ?? "");
+      if (!id || out[id]) continue;
+      out[id] = {
+        current_price: r.current_price != null ? Number(r.current_price) : null,
+        recorded_at: r.recorded_at != null ? String(r.recorded_at) : null
+      };
+    }
+    latestPriceByMarketId = out;
+  }
 
   return {
-    perf: perfError ? null : perf,
-    history: histError || !history ? [] : history
+    perf: (perf as ModelPagePerf) ?? null,
+    history: ((history ?? []) as any[]).map(
+      (h): ModelPageHistory => ({
+        recorded_at: String(h.recorded_at),
+        cumulative_pnl: h.cumulative_pnl != null ? Number(h.cumulative_pnl) : null,
+        bet_pnl: h.bet_pnl != null ? Number(h.bet_pnl) : null,
+        resolved_market_id: h.resolved_market_id ? String(h.resolved_market_id) : null
+      })
+    ),
+    predictions: ((predictions ?? []) as any[]).map(
+      (p): ModelPagePrediction => ({
+        id: String(p.id),
+        market_id: String(p.market_id),
+        model: String(p.model),
+        model_version: p.model_version != null ? String(p.model_version) : null,
+        predicted_at: p.predicted_at != null ? String(p.predicted_at) : null,
+        resolution_date: p.resolution_date != null ? String(p.resolution_date) : null,
+        days_to_resolution: p.days_to_resolution != null ? Number(p.days_to_resolution) : null,
+        time_bucket: p.time_bucket != null ? String(p.time_bucket) : null,
+        blind_estimate: p.blind_estimate != null ? Number(p.blind_estimate) : null,
+        anchored_estimate:
+          p.anchored_estimate != null ? Number(p.anchored_estimate) : null,
+        anchoring_delta: p.anchoring_delta != null ? Number(p.anchoring_delta) : null,
+        crowd_price_at_time:
+          p.crowd_price_at_time != null ? Number(p.crowd_price_at_time) : null,
+        signal: p.signal != null ? String(p.signal) : null,
+        resolved: p.resolved != null ? Boolean(p.resolved) : null,
+        outcome:
+          p.outcome == null ? null : Boolean(p.outcome),
+        pnl: p.pnl != null ? Number(p.pnl) : null,
+        markets: p.markets
+          ? {
+              title: p.markets.title != null ? String(p.markets.title) : null,
+              category: p.markets.category != null ? String(p.markets.category) : null,
+              market_url:
+                p.markets.market_url != null ? String(p.markets.market_url) : null,
+              resolution_date:
+                p.markets.resolution_date != null
+                  ? String(p.markets.resolution_date)
+                  : null
+            }
+          : null
+      })
+    ),
+    categoryPerf: ((categoryPerf ?? []) as any[]).map(
+      (row): ModelPageCategoryPerf => ({
+        category: row.category != null ? String(row.category) : null,
+        total_bets: row.total_bets != null ? Number(row.total_bets) : null,
+        wins: row.wins != null ? Number(row.wins) : null,
+        losses: row.losses != null ? Number(row.losses) : null,
+        total_pnl: row.total_pnl != null ? Number(row.total_pnl) : null
+      })
+    ),
+    latestPriceByMarketId
   };
 }
 
-function buildEquityPoints(history: any[]) {
-  if (!history.length) return [];
-  const maxAbs = Math.max(
-    ...history.map((h) => Math.abs(Number(h.cumulative_pnl ?? 0))),
-    1
-  );
-  return history.map((h, idx) => {
-    const x = (idx / Math.max(history.length - 1, 1)) * 100;
-    const y =
-      50 -
-      (Number(h.cumulative_pnl ?? 0) / maxAbs) *
-        40; /* center at 50, span roughly 80% */
-    return { x, y };
-  });
-}
-
 export default async function ModelPage({ params }: ModelPageProps) {
-  const modelName = decodeURIComponent(params.model);
-  const { perf, history } = await getModelData(modelName);
-  const equityPoints = buildEquityPoints(history as any[]);
+  const slug = params.model.toLowerCase() as ModelSlug;
+  if (!(slug in MODEL_MAP)) notFound();
 
-  const totalPnl = perf?.total_pnl ?? 0;
-  const wins = perf?.wins ?? 0;
-  const losses = perf?.losses ?? 0;
-  const totalBets = wins + losses;
-  const winRate = totalBets > 0 ? wins / totalBets : null;
-  const brier =
-    perf?.brier_score != null ? Number(perf.brier_score).toFixed(3) : "—";
+  const modelName = MODEL_MAP[slug];
+  const data = await getModelPageData(modelName);
 
   return (
-    <main className="min-h-screen px-6 py-10 md:px-12 lg:px-24">
-      <header className="mb-8 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-        <div>
-          <h1 className="text-3xl font-semibold tracking-tight md:text-4xl">
-            {modelName} performance
-          </h1>
-          <p className="mt-2 max-w-xl text-sm text-slate-400">
-            Equity curve, hit rate, and Brier score for {modelName}&apos;s
-            real-money Polymarket bets.
-          </p>
-        </div>
-      </header>
-
-      <section className="grid gap-8 lg:grid-cols-3">
-        <div className="lg:col-span-2 space-y-4">
-          <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-            <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-300">
-                Equity curve
-              </h2>
-              <span className="text-xs text-slate-500">All-time</span>
-            </div>
-            {equityPoints.length === 0 ? (
-              <p className="text-xs text-slate-500">
-                No resolved bets yet for this model.
-              </p>
-            ) : (
-              <svg
-                viewBox="0 0 100 60"
-                className="h-48 w-full rounded-xl bg-slate-950/80"
-                preserveAspectRatio="none"
-              >
-                <polyline
-                  fill="none"
-                  stroke="#22c55e"
-                  strokeWidth="0.9"
-                  points={equityPoints
-                    .map((p) => `${p.x},${p.y}`)
-                    .join(" ")}
-                />
-                <line
-                  x1="0"
-                  x2="100"
-                  y1="50"
-                  y2="50"
-                  stroke="#1e293b"
-                  strokeWidth="0.4"
-                />
-              </svg>
-            )}
-          </div>
-
-          <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 text-xs text-slate-300">
-            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-              Resolved bets
-            </h2>
-            {history.length === 0 ? (
-              <p className="text-slate-500">
-                Once markets start resolving, individual bet results will appear
-                here.
-              </p>
-            ) : (
-              <ul className="space-y-1">
-                {(history as any[])
-                  .slice()
-                  .reverse()
-                  .slice(0, 30)
-                  .map((h) => (
-                    <li
-                      key={h.recorded_at}
-                      className="flex items-center justify-between"
-                    >
-                      <span className="font-mono text-[11px] text-slate-400">
-                        {new Date(h.recorded_at).toLocaleDateString()}
-                      </span>
-                      <span
-                        className={
-                          Number(h.bet_pnl ?? 0) >= 0
-                            ? "text-emerald-400"
-                            : "text-rose-400"
-                        }
-                      >
-                        {Number(h.bet_pnl ?? 0) >= 0 ? "+" : "-"}$
-                        {Math.abs(Math.round(Number(h.bet_pnl ?? 0)))}
-                      </span>
-                    </li>
-                  ))}
-              </ul>
-            )}
-          </div>
-        </div>
-
-        <aside className="space-y-4">
-          <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-300">
-            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-              Summary stats
-            </h2>
-            <p>
-              Cumulative P&amp;L:{" "}
-              <span
-                className={
-                  Number(totalPnl) >= 0 ? "text-emerald-400" : "text-rose-400"
-                }
-              >
-                {Number(totalPnl) >= 0 ? "+" : "-"}$
-                {Math.abs(Math.round(Number(totalPnl)))}
-              </span>
-            </p>
-            <p className="mt-1 text-xs text-slate-400">
-              Win rate:{" "}
-              {winRate == null
-                ? "—"
-                : `${Math.round((winRate ?? 0) * 100)}% (${wins}–${losses})`}
-            </p>
-            <p className="mt-1 text-xs text-slate-400">Brier: {brier}</p>
-          </div>
-
-          <div className="rounded-2xl border border-dashed border-slate-800 bg-slate-950/40 p-4 text-xs text-slate-500">
-            Category breakdown and PASS history will be added here once more
-            data accrues and the resolution checker is live.
-          </div>
-        </aside>
-      </section>
-    </main>
+    <ModelProfileClient
+      modelName={modelName}
+      modelSlug={slug}
+      perf={data.perf}
+      history={data.history}
+      predictions={data.predictions}
+      categoryPerf={data.categoryPerf}
+      latestPriceByMarketId={data.latestPriceByMarketId}
+    />
   );
 }
 

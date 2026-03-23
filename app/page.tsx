@@ -1,6 +1,13 @@
 import { supabaseAdmin } from "@/lib/supabase/server";
 import { getLeaderboardAllTime } from "@/lib/metrics/leaderboard";
 
+const MODEL_SLUG_BY_NAME: Record<string, string> = {
+  Claude: "claude",
+  ChatGPT: "chatgpt",
+  Gemini: "gemini",
+  Grok: "grok"
+};
+
 async function getTodayFeed() {
   const today = new Date();
   const start = new Date(
@@ -88,13 +95,17 @@ export default async function HomePage() {
             {leaderboard.map((row) => (
               <a
                 key={row.model}
-                href={`/model/${encodeURIComponent(row.model)}`}
+                href={`/model/${MODEL_SLUG_BY_NAME[row.model] ?? encodeURIComponent(row.model.toLowerCase())}`}
                 className="flex flex-col rounded-xl border border-slate-700 bg-slate-900/60 px-3 py-2 hover:border-emerald-400/70"
               >
                 <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
                   {row.model}
                 </span>
-                <span className="mt-1 text-base font-semibold text-emerald-400">
+                <span
+                  className={`mt-1 text-base font-semibold ${
+                    row.totalPnl >= 0 ? "text-emerald-400" : "text-red-400"
+                  }`}
+                >
                   {row.totalPnl >= 0 ? "+" : "-"}$
                   {Math.abs(Math.round(row.totalPnl))}
                 </span>

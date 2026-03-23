@@ -3,9 +3,46 @@
 import { useState, useEffect } from "react";
 import { buildTwitterIntentUrl } from "@/lib/social/twitterIntent";
 
+/** Persisted so a full page reload (e.g. after pipeline) restores the last tab. */
+const ADMIN_SECTION_KEY = "polycast-admin-active-section";
+
+type AdminSection =
+  | "pending"
+  | "approved"
+  | "resolved"
+  | "blueskyPending"
+  | "blueskySent";
+
+const ADMIN_SECTIONS: AdminSection[] = [
+  "pending",
+  "approved",
+  "resolved",
+  "blueskyPending",
+  "blueskySent"
+];
+
+function readStoredAdminSection(): AdminSection | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = sessionStorage.getItem(ADMIN_SECTION_KEY);
+    if (!raw || !ADMIN_SECTIONS.includes(raw as AdminSection)) return null;
+    return raw as AdminSection;
+  } catch {
+    return null;
+  }
+}
+
+function sortPendingByCreatedAtDesc(a: AdminMarket, b: AdminMarket): number {
+  const at = a.created_at ? new Date(a.created_at).getTime() : 0;
+  const bt = b.created_at ? new Date(b.created_at).getTime() : 0;
+  return bt - at;
+}
+
 interface AdminMarket {
   id: string;
   polymarket_id: string;
+  /** Used to restore sort order after failed optimistic update */
+  created_at?: string;
   title: string;
   social_title: string | null;
   category: string | null;
@@ -66,12 +103,6 @@ export function AdminDashboard({
   blueskyPendingPosts: initialBlueskyPendingPosts = [],
   blueskySentPosts: initialBlueskySentPosts = []
 }: Props) {
-  type AdminSection =
-    | "pending"
-    | "approved"
-    | "resolved"
-    | "blueskyPending"
-    | "blueskySent";
   const [pending, setPending] = useState(initialPending);
   const [approved, setApproved] = useState(initialApproved);
   const [resolved, setResolved] = useState(initialResolved);
@@ -85,6 +116,8 @@ export function AdminDashboard({
   const [pipelineBusy, setPipelineBusy] = useState(false);
   const [pipelineMessage, setPipelineMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  /** Stays in sync with server pending count for the “X of Y loaded” banner; updated optimistically. */
+  const [pendingTotalCount, setPendingTotalCount] = useState(pendingCount);
 
   useEffect(() => {
     setPending(initialPending);
@@ -107,11 +140,21 @@ export function AdminDashboard({
   }, [initialBlueskySentPosts]);
 
   useEffect(() => {
-    const t = setInterval(() => {
-      window.location.reload();
-    }, 30_000);
-    return () => clearInterval(t);
+    setPendingTotalCount(pendingCount);
+  }, [pendingCount]);
+
+  useEffect(() => {
+    const s = readStoredAdminSection();
+    if (s) setActiveSection(s);
   }, []);
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(ADMIN_SECTION_KEY, activeSection);
+    } catch {
+      /* ignore quota / private mode */
+    }
+  }, [activeSection]);
 
   async function runPipeline() {
     setPipelineBusy(true);
@@ -175,18 +218,28 @@ export function AdminDashboard({
     }
   }
 
-  async function action(marketId: string, action: "approve" | "reject" | "hold") {
+  async function action(
+    marketId: string,
+    actionType: "approve" | "reject" | "hold"
+  ) {
+    const removed = pending.find((m) => m.id === marketId);
+    if (!removed) return;
+
+    setPending((prev) => prev.filter((m) => m.id !== marketId));
+    setPendingTotalCount((c) => Math.max(0, c - 1));
+
     setBusyId(marketId);
     try {
-      const res = await fetch(`/api/admin/markets/${marketId}/${action}`, {
+      const res = await fetch(`/api/admin/markets/${marketId}/${actionType}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" }
       });
-      if (!res.ok) throw new Error(`${action} failed`);
-      setTimeout(() => window.location.reload(), 800);
+      if (!res.ok) throw new Error(`${actionType} failed`);
     } catch (err) {
       console.error(err);
-      alert(`${action} failed`);
+      setPending((prev) => [...prev, removed].sort(sortPendingByCreatedAtDesc));
+      setPendingTotalCount((c) => c + 1);
+      alert(`${actionType} failed`);
     } finally {
       setBusyId(null);
     }
@@ -369,11 +422,12 @@ export function AdminDashboard({
       {activeSection === "pending" && (
       <section>
         <h2 className="mb-3 text-lg font-semibold text-slate-100">
-          Pending markets ({pending.length}{pending.length !== pendingCount ? ` of ${pendingCount}` : ""})
+          Pending markets ({pending.length}
+          {pending.length !== pendingTotalCount ? ` of ${pendingTotalCount}` : ""})
         </h2>
-        {pending.length !== pendingCount && pendingCount > 0 && (
+        {pending.length !== pendingTotalCount && pendingTotalCount > 0 && (
           <p className="mb-2 text-sm text-amber-400">
-            DB has {pendingCount} pending; only {pending.length} loaded. Refresh or check server logs.
+            DB has {pendingTotalCount} pending; only {pending.length} loaded. Refresh or check server logs.
           </p>
         )}
         {pending.length === 0 ? (
