@@ -50,6 +50,30 @@ function toDateValue(s: string | null): number {
   return Number.isFinite(t) ? t : 0;
 }
 
+/** Axis labels: signed dollars without forcing "+" on positive (cleaner ticks). */
+function fmtAxisUsd(n: number): string {
+  const r = Math.round(n);
+  const sign = r < 0 ? "-" : "";
+  return `${sign}$${Math.abs(r).toLocaleString()}`;
+}
+
+function formatShortDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+/** ~4–5 evenly spaced Y ticks including min/max domain used for scaling. */
+function buildYTicks(rangeMin: number, rangeMax: number, count = 5): number[] {
+  const span = rangeMax - rangeMin;
+  if (span <= 0) {
+    const pad = Math.max(Math.abs(rangeMin) * 0.05, 25);
+    return buildYTicks(rangeMin - pad, rangeMax + pad, count);
+  }
+  const step = span / (count - 1);
+  return Array.from({ length: count }, (_, i) => rangeMin + step * i);
+}
+
 function EquityChart({
   history,
   windowKey
@@ -65,22 +89,76 @@ function EquityChart({
     return history.filter((h) => toDateValue(h.recorded_at) >= minTs);
   }, [history, windowKey]);
 
-  const points = useMemo(() => {
-    if (filtered.length === 0) return [];
-    const vals = filtered.map((h) => Number(h.cumulative_pnl ?? 0));
-    const minY = Math.min(...vals);
-    const maxY = Math.max(...vals);
-    const pad = Math.max((maxY - minY) * 0.1, 10);
-    const rangeMin = minY - pad;
-    const rangeMax = maxY + pad;
-    const range = Math.max(rangeMax - rangeMin, 1);
+  const chartGeom = useMemo(() => {
+    const W = 720;
+    const H = 300;
+    const pad = { left: 58, right: 18, top: 16, bottom: 44 };
+    const innerW = W - pad.left - pad.right;
+    const innerH = H - pad.top - pad.bottom;
+    return { W, H, pad, innerW, innerH };
+  }, []);
 
-    return filtered.map((h, i) => {
-      const x = (i / Math.max(filtered.length - 1, 1)) * 100;
-      const y = 100 - ((Number(h.cumulative_pnl ?? 0) - rangeMin) / range) * 100;
-      return { x, y };
-    });
-  }, [filtered]);
+  const layout = useMemo(() => {
+    if (filtered.length === 0) return null;
+
+    const vals = filtered.map((h) => Number(h.cumulative_pnl ?? 0));
+    const dataMin = Math.min(...vals);
+    const dataMax = Math.max(...vals);
+    const spread = dataMax - dataMin;
+    const padY = Math.max(spread * 0.12, 25);
+    let rangeMin = dataMin - padY;
+    let rangeMax = dataMax + padY;
+    if (rangeMax - rangeMin < 1) {
+      rangeMin -= 50;
+      rangeMax += 50;
+    }
+    const ySpan = rangeMax - rangeMin;
+
+    const yTicks = buildYTicks(rangeMin, rangeMax, 5);
+
+    const n = filtered.length;
+    const xAt = (i: number) =>
+      chartGeom.pad.left + (n <= 1 ? chartGeom.innerW / 2 : (i / (n - 1)) * chartGeom.innerW);
+    const yAt = (v: number) =>
+      chartGeom.pad.top +
+      chartGeom.innerH -
+      ((v - rangeMin) / ySpan) * chartGeom.innerH;
+
+    const linePoints = filtered.map((h, i) => ({
+      x: xAt(i),
+      y: yAt(Number(h.cumulative_pnl ?? 0))
+    }));
+
+    const last = Number(filtered[filtered.length - 1]?.cumulative_pnl ?? 0);
+    const lineColor = last >= 0 ? "#22c55e" : "#f43f5e";
+
+    const zeroY =
+      rangeMin <= 0 && rangeMax >= 0 ? yAt(0) : null;
+
+    const xLabelIndices =
+      n <= 1
+        ? [0]
+        : n === 2
+          ? [0, 1]
+          : [0, Math.floor((n - 1) / 2), n - 1];
+
+    const xLabels = xLabelIndices.map((i) => ({
+      x: xAt(i),
+      label: formatShortDate(filtered[i].recorded_at)
+    }));
+
+    return {
+      ...chartGeom,
+      rangeMin,
+      rangeMax,
+      yTicks,
+      yAt,
+      linePoints,
+      lineColor,
+      zeroY,
+      xLabels
+    };
+  }, [filtered, chartGeom]);
 
   if (filtered.length === 0) {
     return (
@@ -90,30 +168,110 @@ function EquityChart({
     );
   }
 
-  const vals = filtered.map((h) => Number(h.cumulative_pnl ?? 0));
-  const minY = Math.min(...vals);
-  const maxY = Math.max(...vals);
-  const last = Number(filtered[filtered.length - 1]?.cumulative_pnl ?? 0);
-  const lineColor = last >= 0 ? "#22c55e" : "#f43f5e";
+  if (!layout) return null;
+
+  const { W, H, pad, innerW, innerH, yTicks, yAt, linePoints, lineColor, zeroY, xLabels } =
+    layout;
 
   return (
     <div className="space-y-2">
-      <div className="relative h-72 w-full overflow-hidden rounded-xl border border-slate-800 bg-slate-950/80 p-3">
-        <svg viewBox="0 0 100 100" className="h-full w-full" preserveAspectRatio="none">
-          <line x1="0" x2="100" y1="50" y2="50" stroke="#1e293b" strokeWidth="0.4" />
+      <p className="text-center text-[11px] font-medium uppercase tracking-wide text-slate-500">
+        Cumulative P&amp;L (USD)
+      </p>
+      <div className="w-full overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/80">
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          className="min-h-[260px] w-full min-w-[320px]"
+          preserveAspectRatio="xMidYMid meet"
+          role="img"
+          aria-label="Equity curve: cumulative profit and loss over time"
+        >
+          {/* Plot border */}
+          <rect
+            x={pad.left}
+            y={pad.top}
+            width={innerW}
+            height={innerH}
+            fill="none"
+            stroke="#334155"
+            strokeWidth={1}
+          />
+
+          {/* Y grid + labels */}
+          {yTicks.map((tick) => {
+            const y = yAt(tick);
+            return (
+              <g key={tick}>
+                <line
+                  x1={pad.left}
+                  x2={pad.left + innerW}
+                  y1={y}
+                  y2={y}
+                  stroke="#1e293b"
+                  strokeWidth={1}
+                  strokeDasharray="4 4"
+                />
+                <text
+                  x={pad.left - 8}
+                  y={y + 4}
+                  textAnchor="end"
+                  fill="#94a3b8"
+                  style={{ fontSize: 11 }}
+                >
+                  {fmtAxisUsd(tick)}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* X axis line */}
+          <line
+            x1={pad.left}
+            x2={pad.left + innerW}
+            y1={pad.top + innerH}
+            y2={pad.top + innerH}
+            stroke="#475569"
+            strokeWidth={1}
+          />
+
+          {/* Zero line (P&amp;L = 0) when visible */}
+          {zeroY != null && zeroY >= pad.top && zeroY <= pad.top + innerH ? (
+            <line
+              x1={pad.left}
+              x2={pad.left + innerW}
+              y1={zeroY}
+              y2={zeroY}
+              stroke="#64748b"
+              strokeWidth={1}
+            />
+          ) : null}
+
+          {/* Equity line */}
           <polyline
             fill="none"
             stroke={lineColor}
-            strokeWidth="0.9"
-            points={points.map((p) => `${p.x},${p.y}`).join(" ")}
+            strokeWidth={2}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            points={linePoints.map((p) => `${p.x},${p.y}`).join(" ")}
           />
+
+          {/* X tick labels */}
+          {xLabels.map((xl, idx) => (
+            <text
+              key={idx}
+              x={xl.x}
+              y={H - 10}
+              textAnchor="middle"
+              fill="#94a3b8"
+              style={{ fontSize: 11 }}
+            >
+              {xl.label}
+            </text>
+          ))}
         </svg>
       </div>
-      <div className="flex items-center justify-between text-xs text-slate-400">
-        <span>Min: {fmtUsd(minY)}</span>
-        <span>Y-axis: cumulative P&amp;L (USD)</span>
-        <span>Max: {fmtUsd(maxY)}</span>
-      </div>
+      <p className="text-center text-[11px] text-slate-500">Date (resolved)</p>
     </div>
   );
 }
