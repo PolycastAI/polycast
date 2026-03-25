@@ -264,11 +264,52 @@ export async function buildSlotShortlist(
   };
 }
 
+function mergeNestedMarketIntoEvent(
+  rec: Record<string, unknown>,
+  m0: Record<string, unknown>,
+  eventId: string
+): GammaMarket {
+  const eventClosed = rec.closed === true;
+  const marketClosed = m0.closed === true;
+  return {
+    ...(m0 as unknown as GammaMarket),
+    id: (m0.id as string) ?? eventId,
+    question: (m0.question as string | null) ?? (typeof rec.title === "string" ? rec.title : null),
+    description: (m0.description as string | null) ?? (rec.description as string | null),
+    endDate: (m0.endDate as string | null) ?? (rec.endDate as string | null),
+    volume: rec.volume ?? m0.volume,
+    closed: eventClosed || marketClosed,
+    active: rec.active ?? m0.active
+  } as GammaMarket;
+}
+
+/** Rough match between our DB title and Gamma nested `question` (multi-market events). */
+function scoreTitleMatch(
+  hint: string | null | undefined,
+  question: string | null | undefined
+): number {
+  const h = (hint ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  const q = (question ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!h || !q) return 0;
+  const h48 = h.slice(0, 48);
+  const q48 = q.slice(0, 48);
+  if (h.length >= 12 && q.includes(h48)) return 100;
+  if (q.length >= 12 && h.includes(q48)) return 100;
+  let n = 0;
+  for (const w of h.split(" ")) {
+    if (w.length > 4 && q.includes(w)) n++;
+  }
+  return n;
+}
+
 /**
- * When `polymarket_id` in DB is a Gamma **event** id, GET /markets/{id} fails.
- * Fall back to GET /events?id= and use the first nested market (same shape as shortlist).
+ * GET /events?id= — build merged Gamma rows for each nested market.
+ * If multiple nested markets exist, prefer the one with a usable resolution outcome; tie-break with title hint.
  */
-async function fetchFirstMarketFromEventById(eventId: string): Promise<GammaMarket | null> {
+async function fetchBestMarketFromEventById(
+  eventId: string,
+  titleHint?: string | null
+): Promise<GammaMarket | null> {
   try {
     const res = await fetch(`${GAMMA_BASE}/events?id=${encodeURIComponent(eventId)}`, {
       cache: "no-store"
@@ -280,21 +321,44 @@ async function fetchFirstMarketFromEventById(eventId: string): Promise<GammaMark
     const rec = ev as Record<string, unknown>;
     const markets = rec.markets;
     if (!Array.isArray(markets) || markets.length < 1) return null;
-    const m0 = markets[0] as Record<string, unknown>;
-    // Gamma often sets `closed` on the nested market OR the parent event — parent `closed: false`
-    // must not override nested `closed: true` (`false ?? true` would incorrectly stay false).
-    const eventClosed = rec.closed === true;
-    const marketClosed = m0.closed === true;
-    return {
-      ...(m0 as unknown as GammaMarket),
-      id: (m0.id as string) ?? eventId,
-      question: (m0.question as string | null) ?? (typeof rec.title === "string" ? rec.title : null),
-      description: (m0.description as string | null) ?? (rec.description as string | null),
-      endDate: (m0.endDate as string | null) ?? (rec.endDate as string | null),
-      volume: rec.volume ?? m0.volume,
-      closed: eventClosed || marketClosed,
-      active: rec.active ?? m0.active
-    } as GammaMarket;
+
+    const merged: GammaMarket[] = [];
+    for (const row of markets) {
+      if (!row || typeof row !== "object") continue;
+      merged.push(mergeNestedMarketIntoEvent(rec, row as Record<string, unknown>, eventId));
+    }
+    if (merged.length === 0) return null;
+
+    const resolved = merged.filter((m) => getResolutionOutcome(m) !== null);
+    if (resolved.length === 1) return resolved[0];
+    if (resolved.length > 1 && titleHint) {
+      let best = resolved[0];
+      let bestScore = scoreTitleMatch(titleHint, best.question);
+      for (let i = 1; i < resolved.length; i++) {
+        const s = scoreTitleMatch(titleHint, resolved[i].question);
+        if (s > bestScore) {
+          best = resolved[i];
+          bestScore = s;
+        }
+      }
+      return best;
+    }
+    if (resolved.length > 1) return resolved[0];
+
+    if (titleHint && merged.length > 1) {
+      let best = merged[0];
+      let bestScore = scoreTitleMatch(titleHint, best.question);
+      for (let i = 1; i < merged.length; i++) {
+        const s = scoreTitleMatch(titleHint, merged[i].question);
+        if (s > bestScore) {
+          best = merged[i];
+          bestScore = s;
+        }
+      }
+      if (bestScore > 0) return best;
+    }
+
+    return merged[0];
   } catch {
     return null;
   }
@@ -312,8 +376,16 @@ function pickBetterGammaFetch(a: GammaMarket | null, b: GammaMarket | null): Gam
   return a;
 }
 
-/** Fetch single market by id, or first market under an event id (shortlist stores event ids). */
-export async function fetchMarketById(polymarketId: string): Promise<GammaMarket | null> {
+export type FetchMarketByIdOptions = {
+  /** When DB `polymarket_id` is an event id with several nested markets, helps pick the right leg. */
+  titleHint?: string | null;
+};
+
+/** Fetch single market by id, or best nested market under an event id (shortlist stores event ids). */
+export async function fetchMarketById(
+  polymarketId: string,
+  options?: FetchMarketByIdOptions
+): Promise<GammaMarket | null> {
   let direct: GammaMarket | null = null;
   try {
     const res = await fetch(`${GAMMA_BASE}/markets/${encodeURIComponent(polymarketId)}`, {
@@ -331,7 +403,7 @@ export async function fetchMarketById(polymarketId: string): Promise<GammaMarket
     (direct.closed !== true && getResolutionOutcome(direct) === null);
 
   const fromEvent = needEventReconcile
-    ? await fetchFirstMarketFromEventById(polymarketId)
+    ? await fetchBestMarketFromEventById(polymarketId, options?.titleHint ?? null)
     : null;
 
   return pickBetterGammaFetch(direct, fromEvent);
