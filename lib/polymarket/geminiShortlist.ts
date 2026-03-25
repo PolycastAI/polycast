@@ -27,7 +27,7 @@ Select 20 events from the list provided. Each row includes id, title, endDate, v
 - Only include binary YES/NO markets with a probability between 10% and 90%
 - Only include events with a known resolution date
 - Only include events with volume above $5,000
-- Time horizon (critical): Strongly prefer markets resolving within the next 30 days. At least 10 of the 20 selected markets must have days_to_resolution of 30 or fewer. Only include longer-horizon markets (31+ days) if they are exceptionally high volume or exceptional interest — use those sparingly to fill remaining slots.
+- Time horizon: Prefer markets resolving within the next 30 days — aim for at least half your selection to resolve within 30 days where the pool allows. Only include longer-horizon markets (31+ days) if they are exceptionally high volume or exceptional interest — use those sparingly to fill remaining slots.
 - Avoid selecting parent events that are collections of sub-markets with vague umbrella titles (e.g. "What will happen before X", "Which price will Y hit", or similar) when the list offers clearer alternatives — prefer events with a single clear YES/NO question. If you must include a multi-outcome parent, deprioritise vague titles in favour of specific, forecastable questions.
 - Include genuine variety across all topics and categories present in the list — politics, economics, crypto, sports, tech, AI, science, culture, entertainment, geopolitics, business, legal, environment, or anything else that appears. Do not over-represent any single category. Spread the selection as broadly as possible across whatever topics are available.
 - Prioritise events that are genuinely uncertain, interesting to forecast, and likely to generate engagement — events in the news, events with recent volume spikes, events where reasonable people disagree
@@ -449,8 +449,9 @@ function padMarketsToTwenty(
 }
 
 /**
- * Ensure at least 10 markets have days_to_resolution in 1–30 by swapping in
- * highest-volume in-range pool events and dropping lowest-volume beyond-30 rows.
+ * Best-effort: shift selection toward 1–30 day horizons by swapping in pool events,
+ * up to min(10, short-horizon count in pool). If the pool cannot support more,
+ * returns the list unchanged (no warning).
  */
 function enforceMinTenWithin30Days(
   markets: ShortlistMarket[],
@@ -462,14 +463,16 @@ function enforceMinTenWithin30Days(
   const countWithin = () =>
     current.filter((m) => isWithin30DaysHorizon(m.days_to_resolution)).length;
 
+  const poolWithin30Count = pool.filter((p) =>
+    isWithin30DaysHorizon(getTimeBucket(now, p.endDate).daysToResolution)
+  ).length;
+  const targetWithin = Math.min(10, poolWithin30Count);
+
   let swaps = 0;
-  while (countWithin() < 10) {
+  while (countWithin() < targetWithin) {
     const within = current.filter((m) => isWithin30DaysHorizon(m.days_to_resolution));
     const beyond = current.filter((m) => !isWithin30DaysHorizon(m.days_to_resolution));
     if (beyond.length === 0) {
-      console.warn(
-        `[shortlist] Cannot reach 10 within-30 markets: no beyond-30 rows left to replace (have ${within.length}).`
-      );
       break;
     }
 
@@ -483,9 +486,6 @@ function enforceMinTenWithin30Days(
       .sort((a, b) => b.volume - a.volume)[0];
 
     if (!add) {
-      console.warn(
-        `[shortlist] Cannot reach 10 within-30 markets: no eligible pool candidates (currently ${within.length} within 30).`
-      );
       break;
     }
 
@@ -498,7 +498,7 @@ function enforceMinTenWithin30Days(
 
   if (swaps > 0) {
     console.log(
-      `[shortlist] Enforced 30-day minimum: ${swaps} swap(s); now ${countWithin()} markets with 1–30 days to resolution.`
+      `[shortlist] Preferred 1–30d horizon: ${swaps} swap(s); now ${countWithin()} within range (pool allows up to ${targetWithin}).`
     );
   }
 
@@ -675,7 +675,7 @@ export async function buildGeminiShortlist(
     isWithin30DaysHorizon(m.days_to_resolution)
   ).length;
   console.log(
-    `[shortlist] Final shortlist: ${markets.length} markets; ${within30} with 1–30 days to resolution (requirement: at least 10)`
+    `[shortlist] Final shortlist: ${markets.length} markets; ${within30} with 1–30 days to resolution (best-effort when pool allows)`
   );
 
   for (const m of markets) {

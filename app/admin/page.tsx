@@ -29,7 +29,7 @@ async function getAdminData() {
         "id, polymarket_id, title, social_title, category, market_geography, resolution_date, market_url, status, current_price, volume, resolution_criteria, created_at"
       )
       .in("status", ["approved", "active"])
-      .order("created_at", { ascending: false });
+      .order("resolution_date", { ascending: true, nullsFirst: false });
 
     const { data: resolvedRows, error: resolvedError } = await supabaseAdmin
       .from("markets")

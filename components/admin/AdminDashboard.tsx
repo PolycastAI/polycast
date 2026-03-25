@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { buildTwitterIntentUrl } from "@/lib/social/twitterIntent";
 
 /** Persisted so a full page reload (e.g. after pipeline) restores the last tab. */
@@ -36,6 +36,13 @@ function sortPendingByCreatedAtDesc(a: AdminMarket, b: AdminMarket): number {
   const at = a.created_at ? new Date(a.created_at).getTime() : 0;
   const bt = b.created_at ? new Date(b.created_at).getTime() : 0;
   return bt - at;
+}
+
+/** Nearest resolution first; missing dates last. */
+function sortApprovedByResolutionAsc(a: AdminMarket, b: AdminMarket): number {
+  const at = a.resolution_date ? new Date(a.resolution_date).getTime() : Number.POSITIVE_INFINITY;
+  const bt = b.resolution_date ? new Date(b.resolution_date).getTime() : Number.POSITIVE_INFINITY;
+  return at - bt;
 }
 
 interface AdminMarket {
@@ -119,6 +126,11 @@ export function AdminDashboard({
   const [approveAllBusy, setApproveAllBusy] = useState(false);
   /** Stays in sync with server pending count for the “X of Y loaded” banner; updated optimistically. */
   const [pendingTotalCount, setPendingTotalCount] = useState(pendingCount);
+
+  const approvedSorted = useMemo(
+    () => [...approved].sort(sortApprovedByResolutionAsc),
+    [approved]
+  );
 
   useEffect(() => {
     setPending(initialPending);
@@ -366,6 +378,37 @@ export function AdminDashboard({
     }
   }
 
+  async function deleteBlueskyPendingPost(postId: string) {
+    if (
+      !confirm(
+        "Remove this queued post from the list and database? This cannot be undone."
+      )
+    ) {
+      return;
+    }
+    setBusyId(postId);
+    setPipelineMessage(null);
+    try {
+      const res = await fetch(`/api/admin/social/bluesky/pending/${postId}`, {
+        method: "DELETE"
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          (body as { error?: string }).error ?? res.statusText ?? "delete failed"
+        );
+      }
+      setBlueskyPendingPosts((prev) => prev.filter((p: { id: string }) => p.id !== postId));
+      setPipelineMessage("Removed queued post.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPipelineMessage(`Error: ${msg}`);
+      alert(`Delete failed: ${msg}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   return (
     <div className="space-y-8">
       <section className="rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-4">
@@ -606,12 +649,38 @@ export function AdminDashboard({
           </p>
         ) : (
           <div className="grid gap-4 md:grid-cols-2">
-            {approved.map((m) => (
+            {approvedSorted.map((m) => (
               <div
                 key={m.id}
                 className="flex flex-col justify-between rounded-xl border border-slate-800 bg-slate-950/60 p-4"
               >
                 <div className="space-y-2">
+                  <div>
+                    <p className="text-base font-bold leading-snug text-slate-100">
+                      {m.resolution_date
+                        ? new Date(m.resolution_date).toLocaleString(undefined, {
+                            dateStyle: "long",
+                            timeStyle: "short"
+                          })
+                        : "Resolution date TBD"}
+                    </p>
+                    {(m.days_to_resolution != null || m.time_bucket) && (
+                      <p className="mt-1 text-xs text-slate-400">
+                        {m.days_to_resolution != null && (
+                          <span>{m.days_to_resolution} days to resolution</span>
+                        )}
+                        {m.time_bucket && (
+                          <>
+                            {m.days_to_resolution != null ? " · " : null}
+                            <span className="font-mono text-slate-300">{m.time_bucket}</span>
+                          </>
+                        )}
+                      </p>
+                    )}
+                  </div>
+
+                  <h3 className="text-base font-semibold leading-snug text-slate-100">{m.title}</h3>
+
                   <div className="rounded border border-slate-700 bg-slate-900/50 p-2">
                     <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
                       AI odds snapshot
@@ -634,7 +703,6 @@ export function AdminDashboard({
                     </div>
                   </div>
 
-                  <h3 className="text-base font-semibold text-slate-100">{m.title}</h3>
                   <p className="text-xs text-slate-400">
                     <span className="font-medium text-slate-300">Category:</span>{" "}
                     {m.category ?? "Uncategorized"}
@@ -655,22 +723,6 @@ export function AdminDashboard({
                         {" "}
                         · <span className="font-medium text-slate-300">Volume:</span> $
                         {Number(m.volume).toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                      </>
-                    )}
-                  </p>
-                  <p className="text-xs text-slate-400">
-                    <span className="font-medium text-slate-300">Resolution:</span>{" "}
-                    {m.resolution_date
-                      ? new Date(m.resolution_date).toLocaleString(undefined, {
-                          dateStyle: "medium",
-                          timeStyle: "short"
-                        })
-                      : "TBD"}
-                    {m.days_to_resolution != null && <> · {m.days_to_resolution} days</>}
-                    {m.time_bucket && (
-                      <>
-                        {" "}
-                        · <span className="font-mono text-slate-300">{m.time_bucket}</span>
                       </>
                     )}
                   </p>
@@ -953,6 +1005,14 @@ export function AdminDashboard({
                     className="rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 shadow hover:bg-emerald-400 disabled:opacity-60"
                   >
                     Send
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deleteBlueskyPendingPost(p.id)}
+                    disabled={busyId === p.id}
+                    className="rounded-full border border-red-500/60 bg-slate-900 px-3 py-1.5 text-xs font-semibold text-red-300 hover:border-red-400 hover:bg-slate-800 disabled:opacity-60"
+                  >
+                    Delete
                   </button>
                   <a
                     href={buildTwitterIntentUrl(
