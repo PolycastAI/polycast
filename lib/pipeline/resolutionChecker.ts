@@ -47,24 +47,10 @@ export async function runResolutionChecker() {
 
   for (const market of markets as any[]) {
     const polymarketId = market.polymarket_id;
-    const titleHint =
-      (market.social_title && String(market.social_title).trim()) ||
-      (market.title && String(market.title).trim()) ||
-      null;
-    const gamma = await fetchMarketById(polymarketId, { titleHint });
-    if (!gamma) {
-      console.log(
-        `[resolution] skip (no Gamma) market_id=${market.id} polymarket_id=${polymarketId}`
-      );
-      continue;
-    }
+    const gamma = await fetchMarketById(polymarketId);
+    if (!gamma) continue;
     const outcome = getResolutionOutcome(gamma);
-    if (outcome === null) {
-      console.log(
-        `[resolution] skip (no outcome yet) market_id=${market.id} polymarket_id=${polymarketId} closed=${gamma.closed} title="${String(market.title ?? "").slice(0, 60)}"`
-      );
-      continue;
-    }
+    if (outcome === null) continue;
 
     const { data: preds, error: predsErr } = await supabaseAdmin
       .from("predictions")
