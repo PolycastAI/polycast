@@ -60,7 +60,7 @@ function fmtAxisUsd(n: number): string {
 function formatShortDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
 /** When two ticks fall on the same calendar day, add time so labels don’t duplicate. */
@@ -78,24 +78,74 @@ function formatXAxisLabel(iso: string, prevIso: string | null): string {
   });
 }
 
-/** ~4–5 evenly spaced Y ticks on [rangeMin, rangeMax]. */
-function buildYTicks(rangeMin: number, rangeMax: number, count = 5): number[] {
-  const span = rangeMax - rangeMin;
-  if (span <= 0) {
-    const pad = Math.max(Math.abs(rangeMin) * 0.05, 25);
-    return buildYTicks(rangeMin - pad, rangeMax + pad, count);
-  }
-  const step = span / (count - 1);
-  return Array.from({ length: count }, (_, i) => rangeMin + step * i);
+/** “Nice” tick step (1–2–5 × 10^n), same idea as d3 / graphing libs. */
+function niceStep(roughStep: number): number {
+  if (!Number.isFinite(roughStep) || roughStep <= 0) return 1;
+  const exp = Math.floor(Math.log10(roughStep));
+  const f = roughStep / Math.pow(10, exp);
+  const nf = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
+  return nf * Math.pow(10, exp);
 }
 
-/** Include a $0 tick whenever zero is in range (so the baseline is labeled). */
-function mergeYTicksWithZero(rangeMin: number, rangeMax: number): number[] {
-  const base = buildYTicks(rangeMin, rangeMax, 5);
-  const set = new Set<number>();
-  for (const t of base) set.add(Math.round(t));
-  if (rangeMin <= 0 && rangeMax >= 0) set.add(0);
-  return Array.from(set).sort((a, b) => a - b);
+/** Rounded, evenly spaced Y ticks (~7); coarsens step if there would be too many labels. */
+function niceYTicks(min: number, max: number, targetCount = 7): number[] {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return [0];
+  let a = min;
+  let b = max;
+  if (a > b) [a, b] = [b, a];
+  if (Math.abs(b - a) < 1e-9) {
+    const pad = Math.max(Math.abs(a) * 0.15, 50);
+    return niceYTicks(a - pad, b + pad, targetCount);
+  }
+  const span = b - a;
+  let step = niceStep(span / Math.max(targetCount - 1, 1));
+  const ticks: number[] = [];
+  for (let guard = 0; guard < 8; guard++) {
+    const niceMin = Math.floor(a / step - 1e-9) * step;
+    const niceMax = Math.ceil(b / step + 1e-9) * step;
+    ticks.length = 0;
+    for (let v = niceMin; v <= niceMax + step * 0.001; v += step) {
+      ticks.push(Math.round(v));
+    }
+    if (ticks.length > 0 && ticks.length <= 10) break;
+    step *= 2;
+  }
+  return ticks.length > 0 ? ticks : [Math.floor(a), Math.ceil(b)];
+}
+
+/** Avoid same-x data → vertical SVG artifacts when two resolutions share a timestamp. */
+function ensureMonotonicX(points: { x: number; y: number }[]): { x: number; y: number }[] {
+  if (points.length <= 1) return points;
+  const out = points.map((p) => ({ x: p.x, y: p.y }));
+  const gap = 0.8;
+  for (let i = 1; i < out.length; i++) {
+    if (out[i].x <= out[i - 1].x) {
+      out[i].x = out[i - 1].x + gap;
+    }
+  }
+  return out;
+}
+
+/** Catmull–Rom → cubic Béziers for a smooth equity line through known points. */
+function catmullRomBezierPath(points: { x: number; y: number }[]): string {
+  const p = points;
+  if (p.length < 2) return "";
+  if (p.length === 2) {
+    return `M ${p[0].x} ${p[0].y} L ${p[1].x} ${p[1].y}`;
+  }
+  let d = `M ${p[0].x} ${p[0].y}`;
+  for (let i = 0; i < p.length - 1; i++) {
+    const p0 = p[Math.max(0, i - 1)];
+    const p1 = p[i];
+    const p2 = p[i + 1];
+    const p3 = p[Math.min(p.length - 1, i + 2)];
+    const cp1x = p1.x + (p2.x - p0.x) / 6;
+    const cp1y = p1.y + (p2.y - p0.y) / 6;
+    const cp2x = p2.x - (p3.x - p1.x) / 6;
+    const cp2y = p2.y - (p3.y - p1.y) / 6;
+    d += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`;
+  }
+  return d;
 }
 
 function EquityChart({
@@ -193,9 +243,11 @@ function EquityChart({
       rangeMin -= 50;
       rangeMax += 50;
     }
-    const ySpan = Math.max(rangeMax - rangeMin, 1e-9);
 
-    const yTicks = mergeYTicksWithZero(rangeMin, rangeMax);
+    const yTicks = niceYTicks(rangeMin, rangeMax, 7);
+    const plotMin = yTicks[0] ?? rangeMin;
+    const plotMax = yTicks[yTicks.length - 1] ?? rangeMax;
+    const ySpan = Math.max(plotMax - plotMin, 1e-9);
 
     const times = series.map((h) => toDateValue(h.recorded_at));
     const tMin = Math.min(...times);
@@ -214,18 +266,21 @@ function EquityChart({
     const yAt = (v: number) =>
       chartGeom.pad.top +
       chartGeom.innerH -
-      ((v - rangeMin) / ySpan) * chartGeom.innerH;
+      ((v - plotMin) / ySpan) * chartGeom.innerH;
 
-    const linePoints = series.map((h, i) => ({
-      x: xAt(i),
-      y: yAt(Number(h.cumulative_pnl ?? 0))
-    }));
+    const linePoints = ensureMonotonicX(
+      series.map((h, i) => ({
+        x: xAt(i),
+        y: yAt(Number(h.cumulative_pnl ?? 0))
+      }))
+    );
+    const linePath = catmullRomBezierPath(linePoints);
 
     const last = Number(series[series.length - 1]?.cumulative_pnl ?? 0);
     const lineColor = last >= 0 ? "#22c55e" : "#f43f5e";
 
     const zeroY =
-      rangeMin <= 0 && rangeMax >= 0 ? yAt(0) : null;
+      plotMin <= 0 && plotMax >= 0 ? yAt(0) : null;
 
     const xLabelIndices =
       n <= 1
@@ -248,7 +303,7 @@ function EquityChart({
       rangeMax,
       yTicks,
       yAt,
-      linePoints,
+      linePath,
       lineColor,
       zeroY,
       xLabels
@@ -265,7 +320,7 @@ function EquityChart({
 
   if (!layout) return null;
 
-  const { W, H, pad, innerW, innerH, yTicks, yAt, linePoints, lineColor, zeroY, xLabels } =
+  const { W, H, pad, innerW, innerH, yTicks, yAt, linePath, lineColor, zeroY, xLabels } =
     layout;
 
   return (
@@ -301,7 +356,7 @@ function EquityChart({
           {/* Y grid + labels ($0 label only here; baseline drawn below) */}
           {yTicks.map((tick, ti) => {
             const y = yAt(tick);
-            const isZero = Math.abs(tick) < 0.5;
+            const isZero = tick === 0;
             return (
               <g key={`y-${ti}-${tick}`}>
                 {!isZero ? (
@@ -350,15 +405,17 @@ function EquityChart({
             />
           ) : null}
 
-          {/* Equity line */}
-          <polyline
-            fill="none"
-            stroke={lineColor}
-            strokeWidth={2}
-            strokeLinejoin="round"
-            strokeLinecap="round"
-            points={linePoints.map((p) => `${p.x},${p.y}`).join(" ")}
-          />
+          {/* Equity curve (smooth Catmull–Rom splines) */}
+          {linePath ? (
+            <path
+              d={linePath}
+              fill="none"
+              stroke={lineColor}
+              strokeWidth={2}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
+          ) : null}
 
           {/* X tick labels */}
           {xLabels.map((xl, idx) => (

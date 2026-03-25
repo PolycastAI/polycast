@@ -116,6 +116,7 @@ export function AdminDashboard({
   const [pipelineBusy, setPipelineBusy] = useState(false);
   const [pipelineMessage, setPipelineMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [approveAllBusy, setApproveAllBusy] = useState(false);
   /** Stays in sync with server pending count for the “X of Y loaded” banner; updated optimistically. */
   const [pendingTotalCount, setPendingTotalCount] = useState(pendingCount);
 
@@ -242,6 +243,56 @@ export function AdminDashboard({
       alert(`${actionType} failed`);
     } finally {
       setBusyId(null);
+    }
+  }
+
+  async function approveAllPending() {
+    const queue = [...pending];
+    if (queue.length === 0) return;
+    if (
+      !confirm(
+        `Approve all ${queue.length} pending market(s)? Each one runs AI pricing and may take a while in total.`
+      )
+    ) {
+      return;
+    }
+
+    setApproveAllBusy(true);
+    setPipelineMessage(null);
+    const remaining = [...queue];
+    const total = queue.length;
+    try {
+      while (remaining.length > 0) {
+        const m = remaining[0];
+        const done = total - remaining.length;
+        setPipelineMessage(
+          `Approving ${done + 1} / ${total}: ${m.title.length > 70 ? `${m.title.slice(0, 70)}…` : m.title}`
+        );
+        const res = await fetch(`/api/admin/markets/${m.id}/approve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        remaining.shift();
+        setPending((prev) => prev.filter((p) => p.id !== m.id));
+        setPendingTotalCount((c) => Math.max(0, c - 1));
+      }
+      setPipelineMessage(`Approved ${total} market(s). Run “Regenerate Approved Odds” if you need a full batch refresh.`);
+    } catch (err) {
+      console.error(err);
+      const failed = remaining[0];
+      setPipelineMessage(
+        failed
+          ? `Approve all stopped: failed on “${failed.title.length > 80 ? `${failed.title.slice(0, 80)}…` : failed.title}”.`
+          : "Approve all failed."
+      );
+      alert(
+        failed
+          ? `Approve failed on “${failed.title}”. Markets approved before this one are already saved.`
+          : "Approve all failed."
+      );
+    } finally {
+      setApproveAllBusy(false);
     }
   }
 
@@ -421,10 +472,22 @@ export function AdminDashboard({
 
       {activeSection === "pending" && (
       <section>
-        <h2 className="mb-3 text-lg font-semibold text-slate-100">
-          Pending markets ({pending.length}
-          {pending.length !== pendingTotalCount ? ` of ${pendingTotalCount}` : ""})
-        </h2>
+        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <h2 className="text-lg font-semibold text-slate-100">
+            Pending markets ({pending.length}
+            {pending.length !== pendingTotalCount ? ` of ${pendingTotalCount}` : ""})
+          </h2>
+          {pending.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => void approveAllPending()}
+              disabled={approveAllBusy || pipelineBusy || busyId != null}
+              className="inline-flex shrink-0 items-center justify-center rounded-full bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow hover:bg-emerald-500 disabled:opacity-60"
+            >
+              {approveAllBusy ? "Approving all…" : `Approve all (${pending.length})`}
+            </button>
+          ) : null}
+        </div>
         {pending.length !== pendingTotalCount && pendingTotalCount > 0 && (
           <p className="mb-2 text-sm text-amber-400">
             DB has {pendingTotalCount} pending; only {pending.length} loaded. Refresh or check server logs.
@@ -505,21 +568,21 @@ export function AdminDashboard({
                 <div className="mt-4 flex flex-wrap items-center gap-2">
                   <button
                     onClick={() => action(m.id, "approve")}
-                    disabled={busyId === m.id}
+                    disabled={busyId === m.id || approveAllBusy}
                     className="rounded-full bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 shadow hover:bg-emerald-400 disabled:opacity-60"
                   >
                     Approve
                   </button>
                   <button
                     onClick={() => action(m.id, "hold")}
-                    disabled={busyId === m.id}
+                    disabled={busyId === m.id || approveAllBusy}
                     className="rounded-full border border-slate-600 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-slate-400 disabled:opacity-60"
                   >
                     Hold
                   </button>
                   <button
                     onClick={() => action(m.id, "reject")}
-                    disabled={busyId === m.id}
+                    disabled={busyId === m.id || approveAllBusy}
                     className="rounded-full bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-300 ring-1 ring-red-500/50 hover:bg-slate-700 disabled:opacity-60"
                   >
                     Reject (7 days)
