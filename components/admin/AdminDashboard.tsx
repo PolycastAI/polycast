@@ -585,7 +585,7 @@ export function AdminDashboard({
                     disabled={busyId === m.id || approveAllBusy}
                     className="rounded-full bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-300 ring-1 ring-red-500/50 hover:bg-slate-700 disabled:opacity-60"
                   >
-                    Reject (7 days)
+                    Reject (2 days)
                   </button>
                 </div>
               </div>
@@ -720,7 +720,7 @@ export function AdminDashboard({
                     disabled={busyId === m.id}
                     className="rounded-full bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-300 ring-1 ring-red-500/50 hover:bg-slate-700 disabled:opacity-60"
                   >
-                    Reject (7 days)
+                    Reject (2 days)
                   </button>
                 </div>
               </div>

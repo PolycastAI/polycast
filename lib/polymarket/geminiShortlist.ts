@@ -5,6 +5,7 @@
 
 import { parseGeminiJsonArray } from "@/lib/ai/geminiJson";
 import { getTimeBucket } from "@/lib/markets/timeBuckets";
+import { sendTelegramMessage } from "@/lib/notifications/telegram";
 import type { ShortlistMarket } from "./types";
 import {
   mapToStandardCategory,
@@ -176,15 +177,61 @@ export function tryParseGammaEvent(ev: unknown): ParsedGammaEvent | null {
   };
 }
 
-async function fetchRawEvents(): Promise<unknown[]> {
-  const res = await fetch(EVENTS_URL, { cache: "no-store" });
-  if (!res.ok) {
-    console.warn("[shortlist] /events fetch failed:", res.status);
-    return [];
+export interface PipelineStepTrace {
+  polymarketHttpStatus: number;
+  polymarketFetchOk: boolean;
+  polymarketRawCount: number;
+  polymarketError: string | null;
+  structuralCount: number;
+  daysCount: number;
+  dedupCount: number;
+  geminiSentCount: number;
+  /** Raw row count from Gemini JSON (before pool id validation / pad). */
+  geminiReturnedCount: number;
+  finalMarketsCount: number;
+  geminiFailed: boolean;
+  geminiError: string | null;
+}
+
+export function createEmptyPipelineTrace(): PipelineStepTrace {
+  return {
+    polymarketHttpStatus: 0,
+    polymarketFetchOk: false,
+    polymarketRawCount: 0,
+    polymarketError: null,
+    structuralCount: 0,
+    daysCount: 0,
+    dedupCount: 0,
+    geminiSentCount: 0,
+    geminiReturnedCount: 0,
+    finalMarketsCount: 0,
+    geminiFailed: false,
+    geminiError: null
+  };
+}
+
+async function fetchRawEvents(): Promise<{
+  events: unknown[];
+  status: number;
+  ok: boolean;
+  parseError: string | null;
+}> {
+  let status = 0;
+  try {
+    const res = await fetch(EVENTS_URL, { cache: "no-store" });
+    status = res.status;
+    if (!res.ok) {
+      return { events: [], status, ok: false, parseError: null };
+    }
+    const data = await res.json();
+    const list = Array.isArray(data) ? data : data?.events ?? data?.data ?? [];
+    const events = Array.isArray(list) ? list : [];
+    return { events, status, ok: true, parseError: null };
+  } catch (err) {
+    const msg =
+      err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
+    return { events: [], status: status || 0, ok: false, parseError: msg };
   }
-  const data = await res.json();
-  const list = Array.isArray(data) ? data : data?.events ?? data?.data ?? [];
-  return Array.isArray(list) ? list : [];
 }
 
 export interface StrippedForGemini {
@@ -241,9 +288,19 @@ async function callGeminiForSelection(
 
   const json = await res.json();
   if (!res.ok) {
+    const bodySnippet = JSON.stringify(json, null, 2).slice(0, 3500);
     console.error(
       "[shortlist][Gemini] HTTP error — full body:\n",
-      JSON.stringify(json, null, 2).slice(0, 12000)
+      bodySnippet
+    );
+    const time = new Date().toISOString();
+    const telegramPrefix =
+      res.status === 429
+        ? "⚠️ Polycast Gemini rate limited (429)"
+        : `⚠️ Polycast Gemini API error (HTTP ${res.status})`;
+    await sendTelegramMessage(
+      `${telegramPrefix}\n\n${bodySnippet}\n\nTime: ${time}`,
+      { plain: true }
     );
     throw new Error(`Gemini error ${res.status}: ${JSON.stringify(json).slice(0, 2000)}`);
   }
@@ -453,50 +510,137 @@ function enforceMinTenWithin30Days(
  */
 export async function buildGeminiShortlist(
   existingPolymarketIds: string[],
-  excludedPolymarketIds: string[]
+  excludedPolymarketIds: string[],
+  traceIn?: PipelineStepTrace
 ): Promise<GeminiShortlistResult> {
   const existingSet = new Set(existingPolymarketIds);
   const excludedSet = new Set(excludedPolymarketIds);
+  const t = traceIn ?? createEmptyPipelineTrace();
 
-  const raw = await fetchRawEvents();
+  const rawRes = await fetchRawEvents();
+  t.polymarketHttpStatus = rawRes.status;
+  t.polymarketFetchOk = rawRes.ok && !rawRes.parseError;
+  t.polymarketRawCount = rawRes.events.length;
+  if (rawRes.parseError) {
+    t.polymarketFetchOk = false;
+    t.polymarketError = rawRes.parseError;
+  }
+
+  console.log(
+    `[pipeline] Step 2: Polymarket returned ${rawRes.events.length} events (HTTP ${rawRes.status})`
+  );
+
+  if (rawRes.parseError) {
+    t.polymarketFetchOk = false;
+    t.polymarketError = rawRes.parseError;
+    console.error("[pipeline] Polymarket response JSON error:", rawRes.parseError);
+    await sendTelegramMessage(
+      `⚠️ Polycast Polymarket API response parse error (HTTP ${rawRes.status})\n\n${rawRes.parseError}\nTime: ${new Date().toISOString()}`,
+      { plain: true }
+    );
+  } else if (!rawRes.ok) {
+    t.polymarketError = t.polymarketError ?? `HTTP ${rawRes.status}`;
+    console.error("[pipeline] Polymarket /events request failed:", rawRes.status);
+    await sendTelegramMessage(
+      `⚠️ Polycast Polymarket API error\n\n/events returned HTTP ${rawRes.status}\nTime: ${new Date().toISOString()}`,
+      { plain: true }
+    );
+  } else if (rawRes.events.length === 0) {
+    console.error(
+      "[pipeline] Polymarket returned 0 events after successful HTTP response — check API payload shape"
+    );
+  }
+
+  const raw = rawRes.events;
 
   const structural: ParsedGammaEvent[] = [];
   for (const row of raw) {
     const p = tryParseGammaEvent(row);
     if (p) structural.push(p);
   }
+  t.structuralCount = structural.length;
 
   console.log(
-    `[shortlist] Events passing structural filters (before prediction/rejected/held dedup): ${structural.length}`
+    `[pipeline] Step 3: After structural filters: ${structural.length} events`
   );
+  if (raw.length > 0 && structural.length === 0) {
+    console.error(
+      "[pipeline] All Polymarket events failed structural filters (0 passed)"
+    );
+  }
 
   const nowForFilter = new Date();
   const afterPositiveDays = structural.filter((p) => {
     const { daysToResolution } = getTimeBucket(nowForFilter, p.endDate);
     return daysToResolution != null && daysToResolution > 0;
   });
+  t.daysCount = afterPositiveDays.length;
 
   console.log(
-    `[shortlist] Events after days_to_resolution > 0 filter (before dedup): ${afterPositiveDays.length}`
+    `[pipeline] Step 4: After days_to_resolution filter: ${afterPositiveDays.length} events`
   );
+  if (structural.length > 0 && afterPositiveDays.length === 0) {
+    console.error(
+      "[pipeline] After structural filters, 0 events remained with days_to_resolution > 0"
+    );
+  }
 
   const pool = afterPositiveDays.filter(
     (p) => !existingSet.has(p.polymarketId) && !excludedSet.has(p.polymarketId)
   );
+  t.dedupCount = pool.length;
 
-  console.log(
-    `[shortlist] Candidate pool for Gemini (after dedup): ${pool.length}`
-  );
+  console.log(`[pipeline] Step 5: After dedup: ${pool.length} events`);
+  if (afterPositiveDays.length > 0 && pool.length === 0) {
+    console.error(
+      "[pipeline] Pool is empty after dedup — all candidates may already be predicted, held, or rejected"
+    );
+  }
 
   const nowForStripped = new Date();
   const poolStripped = pool.map((p) => toStripped(p, nowForStripped));
 
   let selected: GeminiSelectionRow[] = [];
   const wantCount = Math.min(20, poolStripped.length);
+  t.geminiSentCount = poolStripped.length;
+  t.geminiReturnedCount = 0;
+  t.geminiFailed = false;
+  t.geminiError = null;
+
+  console.log(
+    `[pipeline] Step 6: Sending ${poolStripped.length} events to Gemini for selection`
+  );
+
   if (poolStripped.length > 0) {
-    const first = await callGeminiForSelection(poolStripped, wantCount);
-    selected = first.filter(
-      (x) => x.id && !existingSet.has(x.id) && !excludedSet.has(x.id)
+    try {
+      const first = await callGeminiForSelection(poolStripped, wantCount);
+      selected = first.filter(
+        (x) => x.id && !existingSet.has(x.id) && !excludedSet.has(x.id)
+      );
+      t.geminiReturnedCount = first.length;
+    } catch (err) {
+      t.geminiFailed = true;
+      t.geminiError =
+        err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
+      console.error("[pipeline] Gemini selection failed — full error:", err);
+      throw err;
+    }
+  } else {
+    console.error(
+      "[pipeline] Skipping Gemini call (0 events in pool after dedup)"
+    );
+  }
+
+  console.log(
+    `[pipeline] Step 7: Gemini returned ${t.geminiReturnedCount} markets`
+  );
+  if (poolStripped.length > 0 && t.geminiReturnedCount === 0) {
+    console.error(
+      "[pipeline] Gemini returned 0 markets (pool was non-empty)"
+    );
+  } else if (poolStripped.length > 0 && selected.length === 0 && t.geminiReturnedCount > 0) {
+    console.error(
+      "[pipeline] Gemini returned rows but none matched the candidate pool (invalid or duplicate ids)"
     );
   }
 
@@ -549,6 +693,8 @@ export async function buildGeminiShortlist(
       market_url: m.marketUrl
     });
   }
+
+  t.finalMarketsCount = markets.length;
 
   return {
     markets,

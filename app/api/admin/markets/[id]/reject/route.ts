@@ -21,8 +21,8 @@ export async function POST(req: Request, { params }: Params) {
 
     if (fetchError) throw fetchError;
 
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-    const resurfaceAt = new Date(Date.now() + sevenDaysMs).toISOString();
+    const resurfaceDelayMs = 2 * 24 * 60 * 60 * 1000;
+    const resurfaceAt = new Date(Date.now() + resurfaceDelayMs).toISOString();
 
     await supabaseAdmin.from("rejected_markets").insert({
       market_id: market?.polymarket_id ?? marketId,

@@ -126,24 +126,78 @@ function ensureMonotonicX(points: { x: number; y: number }[]): { x: number; y: n
   return out;
 }
 
-/** Catmull–Rom → cubic Béziers for a smooth equity line through known points. */
-function catmullRomBezierPath(points: { x: number; y: number }[]): string {
+function signOrZero(v: number): number {
+  if (v > 0) return 1;
+  if (v < 0) return -1;
+  return 0;
+}
+
+/** SciPy-style endpoint slope for PCHIP (shape-preserving). */
+function pchipEdgeSlope(h1: number, h2: number, m1: number, m2: number): number {
+  let d = ((2 * h1 + h2) * m1 - h1 * m2) / (h1 + h2);
+  if (signOrZero(d) !== signOrZero(m1)) d = 0;
+  else if (signOrZero(m1) !== signOrZero(m2) && Math.abs(d) > Math.abs(3 * m1)) {
+    d = 3 * m1;
+  }
+  return d;
+}
+
+/** PCHIP dy/dx at each knot — monotone in x, no loop-the-loops (unlike Catmull–Rom). */
+function pchipSlopesDyDx(xs: number[], ys: number[]): number[] {
+  const n = xs.length;
+  if (n < 2) return new Array(n).fill(0);
+  if (n === 2) {
+    const h = Math.max(xs[1] - xs[0], 1e-12);
+    const s = (ys[1] - ys[0]) / h;
+    return [s, s];
+  }
+  const h: number[] = [];
+  const mk: number[] = [];
+  for (let i = 0; i < n - 1; i++) {
+    h.push(Math.max(xs[i + 1] - xs[i], 1e-12));
+    mk.push((ys[i + 1] - ys[i]) / h[i]);
+  }
+  const dk = new Array<number>(n).fill(0);
+  for (let i = 1; i < n - 1; i++) {
+    const flat =
+      signOrZero(mk[i - 1]) !== signOrZero(mk[i]) || mk[i - 1] === 0 || mk[i] === 0;
+    if (!flat) {
+      const w1 = 2 * h[i] + h[i - 1];
+      const w2 = h[i] + 2 * h[i - 1];
+      dk[i] = (w1 + w2) / (w1 / mk[i - 1] + w2 / mk[i]);
+    }
+  }
+  dk[0] = pchipEdgeSlope(h[0], h[1], mk[0], mk[1]);
+  dk[n - 1] = pchipEdgeSlope(h[n - 2], h[n - 3], mk[n - 2], mk[n - 3]);
+  return dk;
+}
+
+/**
+ * Smooth path through P&amp;L knots, x strictly increasing. Uses cubic Hermite → Bézier
+ * (same idea as d3.curveMonotoneX / SciPy PCHIP): avoids self-crossing when y spikes after a flat region.
+ */
+function pchipBezierPath(points: { x: number; y: number }[]): string {
   const p = points;
   if (p.length < 2) return "";
   if (p.length === 2) {
     return `M ${p[0].x} ${p[0].y} L ${p[1].x} ${p[1].y}`;
   }
+  const xs = p.map((q) => q.x);
+  const ys = p.map((q) => q.y);
+  const m = pchipSlopesDyDx(xs, ys);
   let d = `M ${p[0].x} ${p[0].y}`;
   for (let i = 0; i < p.length - 1; i++) {
-    const p0 = p[Math.max(0, i - 1)];
-    const p1 = p[i];
-    const p2 = p[i + 1];
-    const p3 = p[Math.min(p.length - 1, i + 2)];
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
-    d += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`;
+    const x0 = p[i].x;
+    const y0 = p[i].y;
+    const x1 = p[i + 1].x;
+    const y1 = p[i + 1].y;
+    const h = x1 - x0;
+    if (h < 1e-9) continue;
+    const c1x = x0 + h / 3;
+    const c1y = y0 + (m[i] * h) / 3;
+    const c2x = x1 - h / 3;
+    const c2y = y1 - (m[i + 1] * h) / 3;
+    d += ` C ${c1x} ${c1y}, ${c2x} ${c2y}, ${x1} ${y1}`;
   }
   return d;
 }
@@ -274,7 +328,7 @@ function EquityChart({
         y: yAt(Number(h.cumulative_pnl ?? 0))
       }))
     );
-    const linePath = catmullRomBezierPath(linePoints);
+    const linePath = pchipBezierPath(linePoints);
 
     const last = Number(series[series.length - 1]?.cumulative_pnl ?? 0);
     const lineColor = last >= 0 ? "#22c55e" : "#f43f5e";
@@ -405,7 +459,7 @@ function EquityChart({
             />
           ) : null}
 
-          {/* Equity curve (smooth Catmull–Rom splines) */}
+          {/* Equity curve (PCHIP / monotone cubic — no spline loops) */}
           {linePath ? (
             <path
               d={linePath}

@@ -1,7 +1,11 @@
 /* eslint-disable no-console */
 
 import { supabaseAdmin } from "@/lib/supabase/server";
-import { buildGeminiShortlist } from "@/lib/polymarket/geminiShortlist";
+import {
+  buildGeminiShortlist,
+  createEmptyPipelineTrace,
+  type PipelineStepTrace
+} from "@/lib/polymarket/geminiShortlist";
 import { renderPromptV1, PROMPT_VERSION } from "@/lib/ai/promptV1";
 import { callModelWithRetry, ModelName } from "@/lib/ai/models";
 import { sendTelegramMessage } from "@/lib/notifications/telegram";
@@ -11,6 +15,45 @@ import {
 } from "@/lib/social/bluesky";
 
 type Signal = "BET YES" | "BET NO" | "PASS";
+
+function formatPipelineZeroPendingAlert(args: {
+  trace: PipelineStepTrace;
+  dbWritten: number | null;
+  dbWriteFailed: boolean;
+  dbAttempted: boolean;
+  lastError: string | null;
+}): string {
+  const { trace: t, dbWritten, dbWriteFailed, dbAttempted, lastError } = args;
+  const ts = new Date().toISOString();
+
+  const polymarketLine = !t.polymarketFetchOk ? "FAILED" : `${t.polymarketRawCount} events`;
+  const geminiLine = t.geminiFailed ? "FAILED" : `${t.geminiReturnedCount} markets`;
+  const dbLine =
+    dbWriteFailed || (!dbAttempted && lastError)
+      ? "FAILED"
+      : `${dbWritten ?? 0} markets`;
+
+  const errParts = [
+    lastError,
+    t.geminiError,
+    t.polymarketError
+  ].filter(Boolean);
+  const errText = errParts.length ? errParts.join("; ") : "none";
+
+  return (
+    `⚠️ Polycast Pipeline Failed\n\n` +
+    `Run Pipeline returned 0 markets.\n\n` +
+    `Progress before failure:\n` +
+    `✅ Polymarket fetch: ${polymarketLine}\n` +
+    `✅ Structural filters: ${t.structuralCount} events\n` +
+    `✅ Days filter: ${t.daysCount} events\n` +
+    `✅ Dedup: ${t.dedupCount} events\n` +
+    `✅ Gemini selection: ${geminiLine}\n` +
+    `✅ Database write: ${dbLine}\n\n` +
+    `Error: ${errText}\n` +
+    `Time: ${ts}`
+  );
+}
 
 function classifySignal(edge: number): Signal {
   if (edge > 10) return "BET YES";
@@ -397,12 +440,22 @@ export async function runBlindAndAnchoredPipeline() {
 
 /** Phase 1: Build shortlist, upsert markets as pending, send Telegram. No prompts. */
 export async function runShortlistAndNotifyOnly() {
+  const trace = createEmptyPipelineTrace();
+  let dbAttempted = false;
+  let dbWriteFailed = false;
+  let dbWritten: number | null = null;
+
   const { tokenHealthCheck } = await import("@/lib/pipeline/tokenHealth");
   const health = tokenHealthCheck();
   if (!health.ok) {
-    console.error("Token health check failed:", health.message);
-    await sendTelegramMessage(`Polycast pipeline skipped: ${health.message}`);
-    return;
+    console.error(
+      "[pipeline] Aborted before Step 1: token health check failed:",
+      health.message
+    );
+    await sendTelegramMessage(`Polycast pipeline skipped: ${health.message}`, {
+      plain: true
+    });
+    return { count: 0 };
   }
   try {
     await ensurePromptVersionRow();
@@ -417,7 +470,9 @@ export async function runShortlistAndNotifyOnly() {
       })(),
       getExcludedPolymarketIds()
     ]);
-    const shortlist = await buildGeminiShortlist(existingIds, excludedIds);
+
+    console.log("[pipeline] Step 1: Starting Polymarket fetch");
+    const shortlist = await buildGeminiShortlist(existingIds, excludedIds, trace);
 
     const canWrite = process.env.POLYCAST_SHORTLIST_WRITE_ENABLED === "true";
     if (!canWrite) {
@@ -425,17 +480,26 @@ export async function runShortlistAndNotifyOnly() {
         "[shortlist] Skipping database write (reset_and_insert_shortlist). " +
           "Set POLYCAST_SHORTLIST_WRITE_ENABLED=true after verifying logs."
       );
+      console.log(
+        `[pipeline] Step 8: Skipping database write (dry run) — ${shortlist.markets.length} markets would be written`
+      );
+      console.log(
+        `[pipeline] Step 9: Complete — ${shortlist.markets.length} markets (dry run, not persisted)`
+      );
       await sendTelegramMessage(
         `Polycast shortlist dry run (no DB write).\n` +
           `Raw events: ${shortlist.debug.totalFetched}. Structural: ${shortlist.debug.afterStructuralFilters}. ` +
           `Pool: ${shortlist.debug.afterDedup}. Selected: ${shortlist.markets.length}.\n` +
-          `Set POLYCAST_SHORTLIST_WRITE_ENABLED=true to persist.`
+          `Set POLYCAST_SHORTLIST_WRITE_ENABLED=true to persist.`,
+        { plain: true }
       );
       return { count: shortlist.markets.length };
     }
 
-    // Atomic reset + insert via DB function (clears pending + held, then inserts).
-    console.log("PIPELINE START — deleting pending/held markets (inside reset_and_insert_shortlist)");
+    console.log(
+      `[pipeline] Step 8: Writing ${shortlist.markets.length} markets to database`
+    );
+
     const payload = shortlist.markets.map((m) => ({
       polymarket_id: m.polymarketId,
       title: m.title,
@@ -448,19 +512,44 @@ export async function runShortlistAndNotifyOnly() {
       volume: m.volume ?? null
     }));
 
+    dbAttempted = true;
     const { error: resetError } = await supabaseAdmin.rpc("reset_and_insert_shortlist", {
       new_markets: payload
     });
     if (resetError) {
-      console.error("reset_and_insert_shortlist failed:", resetError);
+      dbWriteFailed = true;
+      console.error("[pipeline] Database write failed — full error:", resetError);
       throw resetError;
     }
-    console.log("DELETED — now writing new markets (completed inside reset_and_insert_shortlist)");
 
     const { count: pendingCount } = await supabaseAdmin
       .from("markets")
       .select("*", { count: "exact", head: true })
       .eq("status", "pending");
+
+    dbWritten = pendingCount ?? 0;
+
+    console.log(
+      `[pipeline] Step 9: Complete — ${dbWritten} pending markets ready for approval`
+    );
+
+    if (dbWritten === 0) {
+      console.error(
+        "[pipeline] Pipeline wrote 0 pending markets — sending Telegram alert"
+      );
+      await sendTelegramMessage(
+        formatPipelineZeroPendingAlert({
+          trace,
+          dbWritten: 0,
+          dbWriteFailed: false,
+          dbAttempted: true,
+          lastError: null
+        }),
+        { plain: true }
+      );
+      console.log("Shortlist finished with 0 pending (no success Telegram spam).");
+      return { count: shortlist.markets.length };
+    }
 
     const selectionForTelegram = JSON.stringify(
       shortlist.markets.map((m) => ({
@@ -497,9 +586,16 @@ export async function runShortlistAndNotifyOnly() {
           : typeof err === "object" && err !== null
             ? JSON.stringify(err).slice(0, 400)
             : String(err);
-    console.error("Shortlist error:", err);
+    console.error("[pipeline] Shortlist error — full error:", err);
     await sendTelegramMessage(
-      `Polycast shortlist failed: ${msg.slice(0, 300)}`
+      formatPipelineZeroPendingAlert({
+        trace,
+        dbWritten,
+        dbWriteFailed,
+        dbAttempted,
+        lastError: msg
+      }),
+      { plain: true }
     );
     throw err;
   }
