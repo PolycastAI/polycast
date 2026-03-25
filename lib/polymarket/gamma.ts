@@ -281,6 +281,10 @@ async function fetchFirstMarketFromEventById(eventId: string): Promise<GammaMark
     const markets = rec.markets;
     if (!Array.isArray(markets) || markets.length < 1) return null;
     const m0 = markets[0] as Record<string, unknown>;
+    // Gamma often sets `closed` on the nested market OR the parent event — parent `closed: false`
+    // must not override nested `closed: true` (`false ?? true` would incorrectly stay false).
+    const eventClosed = rec.closed === true;
+    const marketClosed = m0.closed === true;
     return {
       ...(m0 as unknown as GammaMarket),
       id: (m0.id as string) ?? eventId,
@@ -288,7 +292,7 @@ async function fetchFirstMarketFromEventById(eventId: string): Promise<GammaMark
       description: (m0.description as string | null) ?? (rec.description as string | null),
       endDate: (m0.endDate as string | null) ?? (rec.endDate as string | null),
       volume: rec.volume ?? m0.volume,
-      closed: rec.closed ?? m0.closed,
+      closed: eventClosed || marketClosed,
       active: rec.active ?? m0.active
     } as GammaMarket;
   } catch {
@@ -296,30 +300,59 @@ async function fetchFirstMarketFromEventById(eventId: string): Promise<GammaMark
   }
 }
 
+function pickBetterGammaFetch(a: GammaMarket | null, b: GammaMarket | null): GammaMarket | null {
+  if (!a) return b;
+  if (!b) return a;
+  const oa = getResolutionOutcome(a);
+  const ob = getResolutionOutcome(b);
+  if (oa !== null && ob === null) return a;
+  if (ob !== null && oa === null) return b;
+  if (a.closed === true && b.closed !== true) return a;
+  if (b.closed === true && a.closed !== true) return b;
+  return a;
+}
+
 /** Fetch single market by id, or first market under an event id (shortlist stores event ids). */
 export async function fetchMarketById(polymarketId: string): Promise<GammaMarket | null> {
+  let direct: GammaMarket | null = null;
   try {
     const res = await fetch(`${GAMMA_BASE}/markets/${encodeURIComponent(polymarketId)}`, {
       cache: "no-store"
     });
     if (res.ok) {
-      return (await res.json()) as GammaMarket;
+      direct = (await res.json()) as GammaMarket;
     }
   } catch {
-    // try event id
+    // fall through
   }
-  return fetchFirstMarketFromEventById(polymarketId);
+
+  const needEventReconcile =
+    !direct ||
+    (direct.closed !== true && getResolutionOutcome(direct) === null);
+
+  const fromEvent = needEventReconcile
+    ? await fetchFirstMarketFromEventById(polymarketId)
+    : null;
+
+  return pickBetterGammaFetch(direct, fromEvent);
 }
 
-/** Resolved YES = true, NO = false, not closed or unclear = null. */
+/**
+ * Resolved YES = true, NO = false, unclear = null.
+ * Requires Gamma `closed === true` — we do not infer from outcomePrices alone, since markets can
+ * sit at extreme prices and still flip before official close (bad data if we resolved early).
+ */
 export function getResolutionOutcome(m: GammaMarket | null): boolean | null {
-  if (!m?.closed) return null;
+  if (!m || m.closed !== true) return null;
   const outcomes = parseOutcomes(m.outcomes ?? null);
   const prices = parsePrices(m.outcomePrices ?? null);
   if (outcomes.length !== 2 || prices.length !== 2) return null;
   const yesIdx = outcomes.findIndex((o) => String(o).toLowerCase() === "yes");
   if (yesIdx === -1) return null;
-  if (prices[yesIdx] >= 0.99) return true;
-  if (prices[1 - yesIdx] >= 0.99) return false;
+  const yesP = prices[yesIdx];
+  const noP = prices[1 - yesIdx];
+  if (!Number.isFinite(yesP) || !Number.isFinite(noP)) return null;
+  if (yesP >= 0.99) return true;
+  if (noP >= 0.99) return false;
   return null;
 }

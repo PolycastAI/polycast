@@ -378,6 +378,38 @@ export function AdminDashboard({
     }
   }
 
+  async function deleteAllBlueskyPendingPosts() {
+    const n = blueskyPendingPosts.length;
+    if (n === 0) return;
+    if (
+      !confirm(
+        `Delete all ${n} pending Bluesky post(s) from the database? This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    setPipelineBusy(true);
+    setPipelineMessage(null);
+    try {
+      const res = await fetch("/api/admin/social/bluesky/pending", { method: "DELETE" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          (body as { error?: string }).error ?? res.statusText ?? "delete failed"
+        );
+      }
+      const deleted = (body as { deleted?: number }).deleted ?? 0;
+      setBlueskyPendingPosts([]);
+      setPipelineMessage(`Deleted ${deleted} queued post(s).`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPipelineMessage(`Error: ${msg}`);
+      alert(`Delete all failed: ${msg}`);
+    } finally {
+      setPipelineBusy(false);
+    }
+  }
+
   async function deleteBlueskyPendingPost(postId: string) {
     if (
       !confirm(
@@ -934,14 +966,22 @@ export function AdminDashboard({
           <strong className="text-slate-200">Post on X</strong> is optional—opens X with the text pre-filled. Nothing
           auto-posts from crons.
         </p>
-        <div className="mb-4 flex items-center gap-3">
+        <div className="mb-4 flex flex-wrap items-center gap-3">
           <button
             type="button"
             onClick={sendAllBlueskyPendingPosts}
-            disabled={pipelineBusy || blueskyPendingPosts.length === 0}
+            disabled={pipelineBusy || busyId != null || blueskyPendingPosts.length === 0}
             className="rounded-full border border-emerald-700 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-emerald-200 shadow hover:bg-slate-950 disabled:opacity-60"
           >
             Send All Pending
+          </button>
+          <button
+            type="button"
+            onClick={deleteAllBlueskyPendingPosts}
+            disabled={pipelineBusy || busyId != null || blueskyPendingPosts.length === 0}
+            className="rounded-full border border-red-500/60 bg-slate-950/40 px-3 py-1.5 text-xs font-semibold text-red-300 shadow hover:bg-slate-950 disabled:opacity-60"
+          >
+            Delete all
           </button>
         </div>
         {blueskyPendingPosts.length === 0 ? (
