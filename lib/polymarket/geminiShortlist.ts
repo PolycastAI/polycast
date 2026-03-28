@@ -13,6 +13,7 @@ import {
   STANDARD_CATEGORIES
 } from "./categoryAndGeography";
 import { isNoiseMarket } from "./noiseMarkets";
+import { fetchGammaMarketById } from "./gamma";
 
 const GEO_LABELS =
   "Global, USA, Europe, UK, Russia, Ukraine, Middle East, Asia, Crypto (no geography)";
@@ -61,8 +62,8 @@ export interface ParsedGammaEvent {
   /** Gamma id of the picked sub-market (null if missing on payload). */
   subMarketId: string | null;
   /**
-   * Resolution instant stored as DB `markets.resolution_date`: nested `market.endDate` for the
-   * picked sub-market, or `event.endDate` when the sub-market omits it — never derived from question text.
+   * Resolution instant for DB `markets.resolution_date`: after shortlist build, prefer
+   * `GET /markets/{subMarketId}` (canonical row); embedded `/events` dates are a fallback only.
    */
   endDate: Date;
   endDateIso: string;
@@ -110,18 +111,36 @@ function getGammaEventTitle(e: Record<string, unknown>): string {
   return eventTitle.trim();
 }
 
-function getEndDateFromEvent(e: Record<string, unknown>): Date | null {
-  const endRaw = e.endDate ?? e.endDateIso;
-  if (endRaw == null || endRaw === "") return null;
-  const endDate = new Date(String(endRaw));
-  return isNaN(endDate.getTime()) ? null : endDate;
-}
-
-function getEndDateFromMarket(m: Record<string, unknown>): Date | null {
-  const endRaw = m.endDate ?? m.endDateIso;
-  if (endRaw == null || endRaw === "") return null;
-  const endDate = new Date(String(endRaw));
-  return isNaN(endDate.getTime()) ? null : endDate;
+/**
+ * Resolution instant from a Gamma **market** or **event** record (embedded JSON only).
+ * Mirrors `lib/polymarket/gamma.ts` `resolveEndDate` field order for sync parsing:
+ * `endDate` (full timestamp), `endDateIso` (calendar day → end-of-day UTC), `gameStartTime`.
+ * Using `new Date(endDateIso)` alone is wrong for YYYY-MM-DD (midnight vs EOD).
+ */
+function parseResolutionInstantFromGammaRecord(
+  rec: Record<string, unknown>
+): Date | null {
+  const endDate = rec.endDate;
+  if (endDate != null && endDate !== "") {
+    if (typeof endDate === "number" && Number.isFinite(endDate)) {
+      const d = new Date(endDate);
+      if (!isNaN(d.getTime())) return d;
+    }
+    const d = new Date(String(endDate));
+    if (!isNaN(d.getTime())) return d;
+  }
+  const iso = rec.endDateIso;
+  if (iso != null && String(iso).trim() !== "") {
+    const s = String(iso).trim();
+    const d = new Date(`${s}T23:59:59.000Z`);
+    if (!isNaN(d.getTime())) return d;
+  }
+  const gst = rec.gameStartTime;
+  if (gst != null && gst !== "") {
+    const d = new Date(String(gst));
+    if (!isNaN(d.getTime())) return d;
+  }
+  return null;
 }
 
 /** One Gamma sub-market chosen for an event; all fields come from the same `raw` row. */
@@ -167,7 +186,7 @@ function subMarketIdFromPrimary(m: Record<string, unknown>): string | null {
 
 function getDaysToResolutionForRawEvent(ev: unknown, now: Date): number | null {
   if (!ev || typeof ev !== "object") return null;
-  const endDate = getEndDateFromEvent(ev as Record<string, unknown>);
+  const endDate = getResolutionEndDateForFilters(ev as Record<string, unknown>, now);
   if (!endDate) return null;
   return getTimeBucket(now, endDate).daysToResolution ?? null;
 }
@@ -240,9 +259,9 @@ function getSubMarketResolutionEndDate(
   m: Record<string, unknown>,
   e: Record<string, unknown>
 ): Date | null {
-  const fromMarket = getEndDateFromMarket(m);
+  const fromMarket = parseResolutionInstantFromGammaRecord(m);
   if (fromMarket) return fromMarket;
-  return getEndDateFromEvent(e);
+  return parseResolutionInstantFromGammaRecord(e);
 }
 
 /** Log every nested row for multi-outcome parents: sub_index, question, raw API endDate string. */
@@ -258,14 +277,14 @@ function logMultiOutcomeSubMarketApiEndDates(
     const m = raw as Record<string, unknown>;
     const q = subMarketQuestionText(m) || "(no question)";
     const rawStr = getSubMarketEndDateRawString(m);
-    const hasMarketDate = getEndDateFromMarket(m) != null;
-    const hasEventDate = getEndDateFromEvent(e) != null;
+    const hasMarketDate = parseResolutionInstantFromGammaRecord(m) != null;
+    const hasEventDate = parseResolutionInstantFromGammaRecord(e) != null;
     const resolutionSource =
       hasMarketDate ? "market" : hasEventDate ? "event_fallback" : "none";
     console.log(
       `[shortlist] multi_sub_market: event_id=${eventId} sub_index=${i} question=${JSON.stringify(q.slice(0, 160))} market.endDate_raw=${rawStr === null ? "null" : JSON.stringify(rawStr)} resolution_source=${resolutionSource}`
     );
-    if (rawStr == null && getEndDateFromEvent(e) == null) {
+    if (rawStr == null && parseResolutionInstantFromGammaRecord(e) == null) {
       console.warn(
         `[shortlist] multi_sub_market: event_id=${eventId} sub_index=${i} missing market.endDate and event.endDate — Polymarket/Gamma data gap`
       );
@@ -467,9 +486,60 @@ function buildParsedGammaEventFromRow(
   };
 }
 
+const HYDRATE_MARKET_API_CHUNK = 12;
+
+/**
+ * `/events` nested `markets[]` often mirrors the parent window; per-outcome resolution lives on
+ * `GET /markets/{id}`. Hydrate `ParsedGammaEvent.endDate` from that endpoint when `subMarketId` is set.
+ */
+async function hydrateParsedEventEndDateFromSubMarketApi(
+  p: ParsedGammaEvent
+): Promise<ParsedGammaEvent> {
+  const sid = p.subMarketId?.trim();
+  if (!sid) return p;
+  try {
+    const gm = await fetchGammaMarketById(sid);
+    if (!gm) {
+      if (p.marketsCount > 1) {
+        console.warn(
+          `[shortlist] resolution_date_hydrate_failed: event_id=${p.polymarketId} sub_market_id=${sid} (GET /markets null; keeping embedded date)`
+        );
+      }
+      return p;
+    }
+    const rec = gm as unknown as Record<string, unknown>;
+    const d = parseResolutionInstantFromGammaRecord(rec);
+    if (!d || isNaN(d.getTime())) return p;
+    const driftMs = Math.abs(d.getTime() - p.endDate.getTime());
+    if (p.marketsCount > 1 && driftMs > 60_000) {
+      console.warn(
+        `[shortlist] resolution_date_sub_market_api: event_id=${p.polymarketId} sub_market_id=${sid} events_embedded=${p.endDate.toISOString()} markets_endpoint=${d.toISOString()}`
+      );
+    }
+    return { ...p, endDate: d, endDateIso: d.toISOString() };
+  } catch {
+    return p;
+  }
+}
+
+async function hydrateParsedEventsEndDatesFromMarketApi(
+  rows: ParsedGammaEvent[]
+): Promise<ParsedGammaEvent[]> {
+  const out: ParsedGammaEvent[] = [];
+  for (let i = 0; i < rows.length; i += HYDRATE_MARKET_API_CHUNK) {
+    const chunk = rows.slice(i, i + HYDRATE_MARKET_API_CHUNK);
+    const done = await Promise.all(
+      chunk.map((row) => hydrateParsedEventEndDateFromSubMarketApi(row))
+    );
+    out.push(...done);
+  }
+  return out;
+}
+
 /**
  * Parse one Gamma event; returns null if it fails the same filters as the shortlist pipeline
  * (noise, resolved parent, shell, probability 7–93%, tiered volume, days_to_resolution > 0).
+ * Does not call `GET /markets/{subMarketId}` — `buildGeminiShortlist` hydrates `endDate` after parse.
  */
 export function tryParseGammaEvent(ev: unknown, nowArg?: Date): ParsedGammaEvent | null {
   const now = nowArg ?? new Date();
@@ -1097,8 +1167,22 @@ export async function buildGeminiShortlist(
     if (p) structural.push(p);
   }
 
+  const structuralHydrated = await hydrateParsedEventsEndDatesFromMarketApi(structural);
+  const nowPostHydrate = new Date();
+  const structuralFinal = structuralHydrated.filter((p) => {
+    const { daysToResolution } = getTimeBucket(nowPostHydrate, p.endDate);
+    if (daysToResolution == null || daysToResolution <= 0) return false;
+    return p.volume >= minVolumeForDays(daysToResolution);
+  });
+
+  if (structuralHydrated.length > structuralFinal.length) {
+    console.log(
+      `[shortlist] resolution_date_hydrate: dropped ${structuralHydrated.length - structuralFinal.length} row(s) after GET /markets/{sub_market_id} (days≤0 or volume tier)`
+    );
+  }
+
   t.structuralCount = afterVol.length;
-  t.daysCount = structural.length;
+  t.daysCount = structuralFinal.length;
 
   console.log(
     `[pipeline] Step 3: After structural filters (pre–days): ${afterVol.length} events`
@@ -1110,15 +1194,15 @@ export async function buildGeminiShortlist(
   }
 
   console.log(
-    `[pipeline] Step 4: After days_to_resolution filter: ${structural.length} events`
+    `[pipeline] Step 4: After days_to_resolution filter: ${structuralFinal.length} events`
   );
-  if (afterVol.length > 0 && structural.length === 0) {
+  if (afterVol.length > 0 && structuralFinal.length === 0) {
     console.error(
       "[pipeline] After volume filter, 0 events remained with days_to_resolution > 0"
     );
   }
 
-  const pool = structural.filter(
+  const pool = structuralFinal.filter(
     (p) => !existingSet.has(p.polymarketId) && !excludedSet.has(p.polymarketId)
   );
   t.dedupCount = pool.length;
@@ -1127,7 +1211,7 @@ export async function buildGeminiShortlist(
     `[shortlist] After dedup against DB: ${pool.length} events — sending to Gemini`
   );
   console.log(`[pipeline] Step 5: After dedup: ${pool.length} events`);
-  if (structural.length > 0 && pool.length === 0) {
+  if (structuralFinal.length > 0 && pool.length === 0) {
     console.error(
       "[pipeline] Pool is empty after dedup — all candidates may already be predicted, held, or rejected"
     );
@@ -1239,7 +1323,7 @@ export async function buildGeminiShortlist(
     debug: {
       totalFetched: rawRes.events.length,
       afterStructuralFilters: afterVol.length,
-      afterDaysToResolutionFilter: structural.length,
+      afterDaysToResolutionFilter: structuralFinal.length,
       afterDedup: pool.length,
       afterGemini: markets.length
     }
