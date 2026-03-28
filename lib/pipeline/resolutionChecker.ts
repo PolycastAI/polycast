@@ -1,7 +1,11 @@
 /* eslint-disable no-console */
 
 import { supabaseAdmin } from "@/lib/supabase/server";
-import { fetchMarketById, getResolutionOutcome } from "@/lib/polymarket/gamma";
+import {
+  fetchGammaMarketById,
+  fetchMarketById,
+  getResolutionOutcome
+} from "@/lib/polymarket/gamma";
 import { computePnl, brierScore } from "@/lib/pipeline/pnl";
 import {
   postResolutionToBluesky,
@@ -27,7 +31,9 @@ export async function runResolutionChecker() {
 
   const { data: markets, error: marketError } = await supabaseAdmin
     .from("markets")
-    .select("id, polymarket_id, title, social_title, post_id_bluesky, market_url")
+    .select(
+      "id, polymarket_id, sub_market_id, title, social_title, post_id_bluesky, market_url"
+    )
     .in("id", marketIds);
 
   if (marketError || !markets?.length) return;
@@ -45,10 +51,27 @@ export async function runResolutionChecker() {
       new Date((firstPred as any).predicted_at).getTime() < week3Cutoff
   );
 
+  /**
+   * Outcome source: Gamma GET /markets/{id}. For multi-outcome parents, `polymarket_id` is the
+   * event id and the forecast targets a nested row — we persist that row’s id in `sub_market_id` and
+   * must fetch that id here. When `sub_market_id` is null, `polymarket_id` may be an event id, so
+   * `fetchMarketById` keeps the event→first-market fallback. Does not gate on DB `resolution_date`.
+   */
   for (const market of markets as any[]) {
-    const polymarketId = market.polymarket_id;
-    const gamma = await fetchMarketById(polymarketId);
-    if (!gamma) continue;
+    const subRaw = market.sub_market_id;
+    const subId =
+      subRaw != null && String(subRaw).trim() !== "" ? String(subRaw).trim() : null;
+    const gamma = subId
+      ? await fetchGammaMarketById(subId)
+      : await fetchMarketById(String(market.polymarket_id));
+    if (!gamma) {
+      if (subId) {
+        console.warn(
+          `[resolution] No Gamma market for sub_market_id=${subId} (market row id=${market.id})`
+        );
+      }
+      continue;
+    }
     const outcome = getResolutionOutcome(gamma);
     if (outcome === null) continue;
 
@@ -171,7 +194,7 @@ export async function runResolutionChecker() {
         includeCumulative
       });
       console.log(
-        `[resolutionChecker] Queued resolution draft for market ${market.id} (${polymarketId})`
+        `[resolutionChecker] Queued resolution draft for market ${market.id} (gamma=${subId ?? market.polymarket_id})`
       );
     } catch (err) {
       console.error(

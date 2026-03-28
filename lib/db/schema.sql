@@ -7,6 +7,7 @@ create extension if not exists "pgcrypto";
 CREATE TABLE if not exists markets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   polymarket_id TEXT UNIQUE NOT NULL,
+  sub_market_id TEXT,
   title TEXT NOT NULL,
   social_title TEXT,
   category TEXT,
@@ -205,6 +206,7 @@ begin
   -- Insert new pending markets from JSON payload
   insert into markets (
     polymarket_id,
+    sub_market_id,
     title,
     category,
     market_geography,
@@ -217,6 +219,7 @@ begin
   )
   select
     (m->>'polymarket_id')::text,
+    nullif(m->>'sub_market_id', '')::text,
     m->>'title',
     nullif(m->>'category', '')::text,
     nullif(m->>'market_geography', '')::text,

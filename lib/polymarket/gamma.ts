@@ -191,6 +191,7 @@ export async function buildSlotShortlist(
     const marketUrl: string | null = null;
     return {
       polymarketId: item.m.id,
+      nestedMarketsCount: 1,
       title: item.m.question ?? "Untitled",
       description: item.description,
       resolutionDate: item.resolutionDate,
@@ -298,25 +299,34 @@ async function fetchFirstMarketFromEventById(eventId: string): Promise<GammaMark
   }
 }
 
-/** Fetch single market by id, or first market under an event id (shortlist stores event ids). */
-export async function fetchMarketById(polymarketId: string): Promise<GammaMarket | null> {
+/**
+ * GET /markets/{id} only — no event-id fallback.
+ * Use when the id is a concrete Gamma market row (e.g. DB `sub_market_id`). Event fallback would
+ * return the wrong nested market for multi-outcome parents.
+ */
+export async function fetchGammaMarketById(id: string): Promise<GammaMarket | null> {
   try {
-    const res = await fetch(`${GAMMA_BASE}/markets/${encodeURIComponent(polymarketId)}`, {
+    const res = await fetch(`${GAMMA_BASE}/markets/${encodeURIComponent(id)}`, {
       cache: "no-store"
     });
-    if (res.ok) {
-      return (await res.json()) as GammaMarket;
-    }
+    if (res.ok) return (await res.json()) as GammaMarket;
   } catch {
-    // try event id
+    /* empty */
   }
+  return null;
+}
+
+/** Fetch single market by id, or first market under an event id (shortlist stores event ids). */
+export async function fetchMarketById(polymarketId: string): Promise<GammaMarket | null> {
+  const direct = await fetchGammaMarketById(polymarketId);
+  if (direct) return direct;
   return fetchFirstMarketFromEventById(polymarketId);
 }
 
 /**
  * Resolved YES = true, NO = false, unclear = null.
- * Requires Gamma `closed === true` — we do not infer from outcomePrices alone, since markets can
- * sit at extreme prices and still flip before official close (bad data if we resolved early).
+ * Requires Gamma `closed === true`, then reads `outcomePrices` (YES leg ~1 = resolved YES, ~0 = NO).
+ * Used for both parent markets and nested rows fetched via `fetchGammaMarketById(sub_market_id)`.
  */
 export function getResolutionOutcome(m: GammaMarket | null): boolean | null {
   if (!m || m.closed !== true) return null;

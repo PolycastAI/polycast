@@ -58,6 +58,12 @@ export interface ParsedGammaEvent {
   firstMarketQuestion: string | null;
   /** Sub-market description — for multi-outcome parents, same picked sub-market as firstMarketQuestion. */
   firstMarketDescription: string | null;
+  /** Gamma id of the picked sub-market (null if missing on payload). */
+  subMarketId: string | null;
+  /**
+   * Resolution instant stored as DB `markets.resolution_date`: nested `market.endDate` for the
+   * picked sub-market, or `event.endDate` when the sub-market omits it — never derived from question text.
+   */
   endDate: Date;
   endDateIso: string;
   startDate: Date | null;
@@ -111,6 +117,54 @@ function getEndDateFromEvent(e: Record<string, unknown>): Date | null {
   return isNaN(endDate.getTime()) ? null : endDate;
 }
 
+function getEndDateFromMarket(m: Record<string, unknown>): Date | null {
+  const endRaw = m.endDate ?? m.endDateIso;
+  if (endRaw == null || endRaw === "") return null;
+  const endDate = new Date(String(endRaw));
+  return isNaN(endDate.getTime()) ? null : endDate;
+}
+
+/** One Gamma sub-market chosen for an event; all fields come from the same `raw` row. */
+type SelectedSubMarket = {
+  raw: Record<string, unknown>;
+  question: string;
+  description: string | null;
+  endDate: Date;
+  yesDecimal: number;
+};
+
+const SUBMARKET_CACHE = new WeakMap<
+  object,
+  { minuteBucket: number; selection: SelectedSubMarket | null }
+>();
+
+function getSelectedSubMarketCached(
+  e: Record<string, unknown>,
+  now: Date
+): SelectedSubMarket | null {
+  const minuteBucket = Math.floor(now.getTime() / 60_000);
+  const prev = SUBMARKET_CACHE.get(e);
+  if (prev && prev.minuteBucket === minuteBucket) return prev.selection;
+  const selection = selectSubMarketForEvent(e, now);
+  SUBMARKET_CACHE.set(e, { minuteBucket, selection });
+  return selection;
+}
+
+/**
+ * Date used for volume tier, days_to_resolution, and stored resolution_date.
+ * Always the selected sub-market's endDate (single- or multi-outcome).
+ */
+function getResolutionEndDateForFilters(e: Record<string, unknown>, now: Date): Date | null {
+  return getSelectedSubMarketCached(e, now)?.endDate ?? null;
+}
+
+function subMarketIdFromPrimary(m: Record<string, unknown>): string | null {
+  const id = m.id;
+  if (id == null || id === "") return null;
+  const s = String(id).trim();
+  return s || null;
+}
+
 function getDaysToResolutionForRawEvent(ev: unknown, now: Date): number | null {
   if (!ev || typeof ev !== "object") return null;
   const endDate = getEndDateFromEvent(ev as Record<string, unknown>);
@@ -158,80 +212,208 @@ function getYesDecimalFromMarket(m: Record<string, unknown>): number | null {
   return yesDecimal;
 }
 
-/**
- * Single binary sub-market: use it. Multiple: pick the sub-market whose YES price is closest to 50%
- * (stable tie-break: earlier index wins).
- */
-function pickPrimaryMarketForEvent(e: Record<string, unknown>): Record<string, unknown> | null {
-  const markets = e.markets;
-  if (!Array.isArray(markets) || markets.length < 1) return null;
+function subMarketQuestionText(m: Record<string, unknown>): string {
+  const q = m.question;
+  return typeof q === "string" && q.trim() ? q.trim() : "";
+}
 
-  type Cand = { m: Record<string, unknown>; yes: number; idx: number };
-  const candidates: Cand[] = [];
+function subMarketDescriptionText(m: Record<string, unknown>): string | null {
+  const d = m.description;
+  if (typeof d === "string") return d;
+  if (d == null) return null;
+  return String(d);
+}
+
+/** Raw `endDate` / `endDateIso` on the nested market (for logs; no parsing). */
+function getSubMarketEndDateRawString(m: Record<string, unknown>): string | null {
+  const v = m.endDate ?? m.endDateIso;
+  if (v == null || v === "") return null;
+  return String(v);
+}
+
+/**
+ * Authoritative resolution time for a sub-market: that row's `endDate`/`endDateIso` only,
+ * falling back to the parent event end date when the market omits it. No question-text parsing.
+ * DB `markets.resolution_date` / ShortlistMarket.resolutionDate come from this path only.
+ */
+function getSubMarketResolutionEndDate(
+  m: Record<string, unknown>,
+  e: Record<string, unknown>
+): Date | null {
+  const fromMarket = getEndDateFromMarket(m);
+  if (fromMarket) return fromMarket;
+  return getEndDateFromEvent(e);
+}
+
+/** Log every nested row for multi-outcome parents: sub_index, question, raw API endDate string. */
+function logMultiOutcomeSubMarketApiEndDates(
+  e: Record<string, unknown>,
+  eventId: string
+): void {
+  const markets = e.markets;
+  if (!Array.isArray(markets) || markets.length <= 1) return;
   for (let i = 0; i < markets.length; i++) {
     const raw = markets[i];
     if (!raw || typeof raw !== "object") continue;
     const m = raw as Record<string, unknown>;
-    const yes = getYesDecimalFromMarket(m);
-    if (yes == null) continue;
-    candidates.push({ m, yes, idx: i });
-  }
-  if (candidates.length === 0) return null;
-
-  if (markets.length === 1) return candidates[0].m;
-
-  let best = candidates[0];
-  let bestDist = Math.abs(best.yes - 0.5);
-  for (let j = 1; j < candidates.length; j++) {
-    const c = candidates[j];
-    const d = Math.abs(c.yes - 0.5);
-    if (d < bestDist - 1e-12) {
-      best = c;
-      bestDist = d;
+    const q = subMarketQuestionText(m) || "(no question)";
+    const rawStr = getSubMarketEndDateRawString(m);
+    const hasMarketDate = getEndDateFromMarket(m) != null;
+    const hasEventDate = getEndDateFromEvent(e) != null;
+    const resolutionSource =
+      hasMarketDate ? "market" : hasEventDate ? "event_fallback" : "none";
+    console.log(
+      `[shortlist] multi_sub_market: event_id=${eventId} sub_index=${i} question=${JSON.stringify(q.slice(0, 160))} market.endDate_raw=${rawStr === null ? "null" : JSON.stringify(rawStr)} resolution_source=${resolutionSource}`
+    );
+    if (rawStr == null && getEndDateFromEvent(e) == null) {
+      console.warn(
+        `[shortlist] multi_sub_market: event_id=${eventId} sub_index=${i} missing market.endDate and event.endDate — Polymarket/Gamma data gap`
+      );
     }
   }
-  return best.m;
 }
 
-/** Shape required before probability / volume / days filters (excludes noise & all-sub-resolved). */
-function passesGammaShell(e: Record<string, unknown>): boolean {
-  if (e.active !== true || e.closed !== false) return false;
+type EligibleSubCandidate = {
+  raw: Record<string, unknown>;
+  question: string;
+  description: string | null;
+  endDate: Date;
+  yesDecimal: number;
+  idx: number;
+};
 
+function buildEligibleSubMarketCandidates(
+  e: Record<string, unknown>,
+  now: Date
+): EligibleSubCandidate[] {
+  const markets = e.markets;
+  if (!Array.isArray(markets) || markets.length < 1) return [];
+  const eventTitle = getGammaEventTitle(e);
+  const eventId = e.id != null ? String(e.id) : "";
+  const isMulti = markets.length > 1;
+  const out: EligibleSubCandidate[] = [];
+
+  if (isMulti) {
+    logMultiOutcomeSubMarketApiEndDates(e, eventId);
+  }
+
+  for (let i = 0; i < markets.length; i++) {
+    const raw = markets[i];
+    if (!raw || typeof raw !== "object") continue;
+    const m = raw as Record<string, unknown>;
+    if (m.closed !== false) continue;
+
+    const yesDecimal = getYesDecimalFromMarket(m);
+    if (yesDecimal == null || !passesProbabilityBand(yesDecimal)) continue;
+
+    let question = subMarketQuestionText(m);
+    if (!question && markets.length === 1) question = eventTitle;
+    if (!question) continue;
+
+    const endDate = getSubMarketResolutionEndDate(m, e);
+    if (!endDate) continue;
+    if (endDate.getTime() <= now.getTime()) continue;
+
+    const description = subMarketDescriptionText(m);
+
+    out.push({
+      raw: m,
+      question,
+      description,
+      endDate,
+      yesDecimal,
+      idx: i
+    });
+  }
+
+  if (isMulti && out.length > 0) {
+    console.log(
+      `[shortlist] multi_sub_market: event_id=${eventId} eligible_after_filters=${out.length} nested=${markets.length}`
+    );
+  }
+
+  return out;
+}
+
+/**
+ * Pick one sub-market: question, description, prices from that row; resolution time from
+ * `getSubMarketResolutionEndDate` (market endDate, else event endDate). Multi-outcome: closest YES to 50%.
+ */
+function selectSubMarketForEvent(
+  e: Record<string, unknown>,
+  now: Date
+): SelectedSubMarket | null {
+  const markets = e.markets;
+  if (!Array.isArray(markets) || markets.length < 1) return null;
+
+  const eligible = buildEligibleSubMarketCandidates(e, now);
+  if (eligible.length === 0) return null;
+
+  const eventId = e.id != null ? String(e.id) : "";
+  const isMulti = markets.length > 1;
+
+  eligible.sort((a, b) => {
+    const da = Math.abs(a.yesDecimal - 0.5);
+    const db = Math.abs(b.yesDecimal - 0.5);
+    if (Math.abs(da - db) < 1e-12) return a.idx - b.idx;
+    return da - db;
+  });
+
+  const toSelected = (c: EligibleSubCandidate): SelectedSubMarket => ({
+    raw: c.raw,
+    question: c.question,
+    description: c.description,
+    endDate: c.endDate,
+    yesDecimal: c.yesDecimal
+  });
+
+  if (!isMulti) {
+    return toSelected(eligible[0]);
+  }
+
+  console.log(
+    `[shortlist] multi_sub_market_selected: event_id=${eventId} sub_index=${eligible[0].idx} (closest YES to 50% among eligible sub-markets)`
+  );
+  return toSelected(eligible[0]);
+}
+
+function passesEventStructure(e: Record<string, unknown>): boolean {
+  if (e.active !== true || e.closed !== false) return false;
   const markets = e.markets;
   if (!Array.isArray(markets) || markets.length < 1) return false;
-
-  if (pickPrimaryMarketForEvent(e) == null) return false;
-
   const id = e.id != null ? String(e.id) : "";
   if (!id) return false;
-
   const slug = typeof e.slug === "string" && e.slug.trim() ? e.slug.trim() : "";
   if (!slug) return false;
-
   if (!getGammaEventTitle(e)) return false;
-
-  const endDate = getEndDateFromEvent(e);
-  if (!endDate) return false;
-
   return true;
 }
 
-function getYesDecimalFromShellRow(e: Record<string, unknown>): number | null {
-  const m = pickPrimaryMarketForEvent(e);
-  if (!m) return null;
-  return getYesDecimalFromMarket(m);
+/** Shape required before probability / volume / days filters (excludes noise & all-sub-resolved). */
+function passesGammaShell(e: Record<string, unknown>, now: Date): boolean {
+  if (!passesEventStructure(e)) return false;
+  return getSelectedSubMarketCached(e, now) != null;
 }
 
-function buildParsedGammaEventFromRow(e: Record<string, unknown>, yesDecimal: number): ParsedGammaEvent | null {
-  if (!passesGammaShell(e)) return null;
+function getYesDecimalFromShellRow(e: Record<string, unknown>, now: Date): number | null {
+  return getSelectedSubMarketCached(e, now)?.yesDecimal ?? null;
+}
 
-  const primary = pickPrimaryMarketForEvent(e);
-  if (!primary) return null;
+function buildParsedGammaEventFromRow(
+  e: Record<string, unknown>,
+  now: Date
+): ParsedGammaEvent | null {
+  if (!passesGammaShell(e, now)) return null;
+
+  const sel = getSelectedSubMarketCached(e, now);
+  if (!sel) return null;
 
   const markets = e.markets as unknown[];
+  const endDate = sel.endDate;
+  const yesDecimal = sel.yesDecimal;
+  const primary = sel.raw;
 
-  const endDate = getEndDateFromEvent(e);
-  if (!endDate) return null;
+  const subMarketId = subMarketIdFromPrimary(primary);
 
   const volume = num(e.volume);
   if (!Number.isFinite(volume)) return null;
@@ -243,16 +425,8 @@ function buildParsedGammaEventFromRow(e: Record<string, unknown>, yesDecimal: nu
     typeof e.description === "string" ? e.description : e.description == null ? null : String(e.description);
 
   const marketsCount = markets.length;
-  const firstMarketQuestion =
-    typeof primary.question === "string" && primary.question.trim()
-      ? primary.question.trim()
-      : null;
-  const firstMarketDescription =
-    typeof primary.description === "string"
-      ? primary.description
-      : primary.description == null
-        ? null
-        : String(primary.description);
+  const firstMarketQuestion = sel.question;
+  const firstMarketDescription = sel.description;
 
   const startRaw = e.startDate ?? e.startDateIso;
   const startDate =
@@ -280,6 +454,7 @@ function buildParsedGammaEventFromRow(e: Record<string, unknown>, yesDecimal: nu
     marketsCount,
     firstMarketQuestion,
     firstMarketDescription,
+    subMarketId,
     endDate,
     endDateIso: endDate.toISOString(),
     startDate: startDateOk,
@@ -304,19 +479,18 @@ export function tryParseGammaEvent(ev: unknown, nowArg?: Date): ParsedGammaEvent
   if (e.active !== true || e.closed !== false) return null;
   if (isNoiseMarket(getGammaEventTitle(e))) return null;
   if (isEntirelyResolvedParentEvent(ev)) return null;
-  if (!passesGammaShell(e)) return null;
+  if (!passesGammaShell(e, now)) return null;
 
-  const yesDecimal = getYesDecimalFromShellRow(e);
-  if (yesDecimal == null || !passesProbabilityBand(yesDecimal)) return null;
+  const sel = getSelectedSubMarketCached(e, now);
+  if (!sel) return null;
 
-  const endDate = getEndDateFromEvent(e)!;
-  const { daysToResolution } = getTimeBucket(now, endDate);
+  const { daysToResolution } = getTimeBucket(now, sel.endDate);
   if (daysToResolution == null || daysToResolution <= 0) return null;
 
   const volume = num(e.volume);
   if (!Number.isFinite(volume) || volume < minVolumeForDays(daysToResolution)) return null;
 
-  return buildParsedGammaEventFromRow(e, yesDecimal);
+  return buildParsedGammaEventFromRow(e, now);
 }
 
 export interface PipelineStepTrace {
@@ -702,6 +876,8 @@ function buildShortlistMarketFromParsed(
 
   return {
     polymarketId: ev.polymarketId,
+    subMarketId: ev.subMarketId,
+    nestedMarketsCount: ev.marketsCount,
     title: displayTitle,
     description: displayDescription,
     resolutionDate: ev.endDate,
@@ -886,9 +1062,7 @@ export async function buildGeminiShortlist(
   const afterProb = poolRows.filter((ev) => {
     if (!ev || typeof ev !== "object") return false;
     const e = ev as Record<string, unknown>;
-    if (!passesGammaShell(e)) return false;
-    const yes = getYesDecimalFromShellRow(e);
-    return yes != null && passesProbabilityBand(yes);
+    return passesGammaShell(e, nowForFilter);
   });
   console.log(
     `[shortlist] After probability filter (7-93%): ${afterProb.length} events`
@@ -896,7 +1070,7 @@ export async function buildGeminiShortlist(
 
   const afterVol = afterProb.filter((ev) => {
     const e = ev as Record<string, unknown>;
-    const endDate = getEndDateFromEvent(e);
+    const endDate = getResolutionEndDateForFilters(e, nowForFilter);
     if (!endDate) return false;
     const { daysToResolution } = getTimeBucket(nowForFilter, endDate);
     const volume = num(e.volume);
@@ -907,7 +1081,7 @@ export async function buildGeminiShortlist(
 
   const afterDaysRows = afterVol.filter((ev) => {
     const e = ev as Record<string, unknown>;
-    const endDate = getEndDateFromEvent(e);
+    const endDate = getResolutionEndDateForFilters(e, nowForFilter);
     if (!endDate) return false;
     const { daysToResolution } = getTimeBucket(nowForFilter, endDate);
     return daysToResolution != null && daysToResolution > 0;
@@ -919,9 +1093,7 @@ export async function buildGeminiShortlist(
   const structural: ParsedGammaEvent[] = [];
   for (const row of afterDaysRows) {
     const e = row as Record<string, unknown>;
-    const yes = getYesDecimalFromShellRow(e);
-    if (yes == null) continue;
-    const p = buildParsedGammaEventFromRow(e, yes);
+    const p = buildParsedGammaEventFromRow(e, nowForFilter);
     if (p) structural.push(p);
   }
 
@@ -1049,6 +1221,8 @@ export async function buildGeminiShortlist(
         : m.description ?? "";
     console.log("[shortlist] Selected event (final):", {
       title: m.title,
+      resolution_date: m.resolutionDate?.toISOString() ?? null,
+      sub_market_id: m.subMarketId ?? null,
       resolution_criteria_preview: crit,
       crowd_price: m.crowd_price,
       volume: m.volume,

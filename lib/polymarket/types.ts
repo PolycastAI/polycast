@@ -39,6 +39,10 @@ export interface GammaMarket {
 /** Normalized market for shortlist and pipeline */
 export interface ShortlistMarket {
   polymarketId: string;
+  /** Nested Gamma market id when the event has multiple sub-markets (resolution checks). */
+  subMarketId?: string | null;
+  /** Nested `event.markets.length` from Gamma (>1 = multi-outcome parent). */
+  nestedMarketsCount: number;
   title: string;
   description: string | null;
   resolutionDate: Date | null;

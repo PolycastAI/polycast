@@ -500,8 +500,22 @@ export async function runShortlistAndNotifyOnly() {
       `[pipeline] Step 8: Writing ${shortlist.markets.length} markets to database`
     );
 
+    for (const m of shortlist.markets) {
+      if (
+        m.nestedMarketsCount > 1 &&
+        (m.subMarketId == null || String(m.subMarketId).trim() === "")
+      ) {
+        console.warn(
+          "[pipeline] Multi-outcome parent shortlist row missing sub_market_id — " +
+            "resolution checker will use event id and may read the wrong outcome. " +
+            `polymarket_id=${m.polymarketId} title=${JSON.stringify((m.title ?? "").slice(0, 120))}`
+        );
+      }
+    }
+
     const payload = shortlist.markets.map((m) => ({
       polymarket_id: m.polymarketId,
+      sub_market_id: m.subMarketId ?? null,
       title: m.title,
       category: m.category ?? null,
       market_geography: m.marketGeography ?? null,
