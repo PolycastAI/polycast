@@ -173,27 +173,53 @@ const CRITERIA_MONTH_TO_NUM: Record<string, number> = {
 
 const CRITERIA_MONTH_ALT = Object.keys(CRITERIA_MONTH_TO_NUM).join("|");
 
+function criteriaMonthDayYearToUtcEnd(monthKey: string, day: number, year: number): Date | null {
+  const month = CRITERIA_MONTH_TO_NUM[monthKey.toLowerCase()];
+  if (month == null || !Number.isFinite(day) || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, month - 1, day, 23, 59, 59, 999));
+  return isNaN(d.getTime()) ? null : d;
+}
+
 /**
- * Polymarket often ships wrong `endDate` on nested Gamma rows while the same object’s
- * `description` states the binding deadline ("by May 31, 2026, 11:59 PM ET"). This is not
- * title guessing — it reads the official criteria copy only.
+ * Polymarket criteria copy (same row as Gamma `description`), not the question title.
+ * Templates seen in the wild:
+ * - "by May 31, 2026, 11:59 PM ET" (visit / deadline-by)
+ * - "between November 3, 2025 and December 31, 2026, 11:59 PM ET" (window end after `and`)
+ * - "between November 3, 2025, and January 31, 2026, 11:59 PM ET" (comma before `and`)
  */
 function parseResolutionDeadlineFromPolymarketDescription(
   text: string | null | undefined
 ): Date | null {
   if (text == null || typeof text !== "string" || !text.trim()) return null;
-  const re = new RegExp(
+
+  const byRe = new RegExp(
     `\\bby\\s+(${CRITERIA_MONTH_ALT})\\s+(\\d{1,2})(?:st|nd|rd|th)?,\\s*(20\\d{2})\\b`,
     "i"
   );
-  const m = re.exec(text);
-  if (!m) return null;
-  const month = CRITERIA_MONTH_TO_NUM[m[1]!.toLowerCase()];
-  const day = parseInt(m[2]!, 10);
-  const year = parseInt(m[3]!, 10);
-  if (month == null || !Number.isFinite(day) || day < 1 || day > 31) return null;
-  const d = new Date(Date.UTC(year, month - 1, day, 23, 59, 59, 999));
-  return isNaN(d.getTime()) ? null : d;
+  const byM = byRe.exec(text);
+  if (byM) {
+    const d = criteriaMonthDayYearToUtcEnd(
+      byM[1]!,
+      parseInt(byM[2]!, 10),
+      parseInt(byM[3]!, 10)
+    );
+    if (d) return d;
+  }
+
+  const windowEndRe = new RegExp(
+    `(?:,\\s*|\\s+)and\\s+(${CRITERIA_MONTH_ALT})\\s+(\\d{1,2})(?:st|nd|rd|th)?,\\s*(20\\d{2}),\\s*11:59\\s+PM\\s+ET`,
+    "i"
+  );
+  const winM = windowEndRe.exec(text);
+  if (winM) {
+    return criteriaMonthDayYearToUtcEnd(
+      winM[1]!,
+      parseInt(winM[2]!, 10),
+      parseInt(winM[3]!, 10)
+    );
+  }
+
+  return null;
 }
 
 const DESCRIPTION_VS_GAMMA_DRIFT_MS = 12 * 60 * 60 * 1000;
