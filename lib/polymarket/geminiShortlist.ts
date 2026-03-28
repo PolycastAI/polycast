@@ -3,7 +3,7 @@
  * with geography + category in the same response; pad/enforce use in-memory pool only.
  */
 
-import { parseGeminiJsonArray } from "@/lib/ai/geminiJson";
+import { parseGeminiJsonArrayDetailed } from "@/lib/ai/geminiJson";
 import { getTimeBucket } from "@/lib/markets/timeBuckets";
 import { sendTelegramMessage } from "@/lib/notifications/telegram";
 import type { ShortlistMarket } from "./types";
@@ -12,6 +12,7 @@ import {
   normalizeGeography,
   STANDARD_CATEGORIES
 } from "./categoryAndGeography";
+import { isNoiseMarket } from "./noiseMarkets";
 
 const GEO_LABELS =
   "Global, USA, Europe, UK, Russia, Ukraine, Middle East, Asia, Crypto (no geography)";
@@ -19,14 +20,18 @@ const CATEGORY_LABELS = STANDARD_CATEGORIES.join(", ");
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-const EVENTS_URL = `${GAMMA_BASE}/events?active=true&closed=false&limit=100&order=volume&ascending=false`;
+const EVENTS_ACTIVE_BASE = `${GAMMA_BASE}/events?active=true&closed=false&limit=50`;
+const EVENTS_MOST_ACTIVE_TODAY = `${EVENTS_ACTIVE_BASE}&order=volume24hr&ascending=false`;
+const EVENTS_NEWEST = `${EVENTS_ACTIVE_BASE}&order=startDate&ascending=false`;
+const EVENTS_HIGH_LIQUIDITY = `${EVENTS_ACTIVE_BASE}&order=liquidity&ascending=false`;
+const EVENTS_END_DATE_FALLBACK = `${EVENTS_ACTIVE_BASE}&order=endDate&ascending=true`;
 
 const GEMINI_SYSTEM_PROMPT = `You are a market selection agent for Polycast, an AI prediction market forecasting service. Every day you select the 20 most interesting Polymarket events for four AI models to forecast head-to-head.
 
-Select 20 events from the list provided. Each row includes id, title, endDate, volume, crowd_price, and days_to_resolution (integer days from today until resolution). Your selection must:
-- Only include binary YES/NO markets with a probability between 10% and 90%
-- Only include events with a known resolution date
-- Only include events with volume above $5,000
+Select 20 events from the list provided. Each row includes id, title, crowd_price, and days_to_resolution (integer days from today until resolution). Some rows may include an optional category field when the source API provided one. Your selection must:
+- Only include binary YES/NO markets with a probability between 7% and 93%
+- Only include events with a known resolution horizon (use days_to_resolution from each row)
+- The list is already pre-filtered for tiered minimum volume by horizon; prefer diverse, high-interest questions
 - Time horizon: Prefer markets resolving within the next 30 days — aim for at least half your selection to resolve within 30 days where the pool allows. Only include longer-horizon markets (31+ days) if they are exceptionally high volume or exceptional interest — use those sparingly to fill remaining slots.
 - Avoid selecting parent events that are collections of sub-markets with vague umbrella titles (e.g. "What will happen before X", "Which price will Y hit", or similar) when the list offers clearer alternatives — prefer events with a single clear YES/NO question. If you must include a multi-outcome parent, deprioritise vague titles in favour of specific, forecastable questions.
 - Include genuine variety across all topics and categories present in the list — politics, economics, crypto, sports, tech, AI, science, culture, entertainment, geopolitics, business, legal, environment, or anything else that appears. Do not over-represent any single category. Spread the selection as broadly as possible across whatever topics are available.
@@ -49,9 +54,9 @@ export interface ParsedGammaEvent {
   description: string | null;
   /** Number of nested markets under this event (parent "collection" events have > 1). */
   marketsCount: number;
-  /** markets[0].question — used as display title when marketsCount > 1. */
+  /** Sub-market question — for multi-outcome parents, the picked sub-market (YES closest to 50%). */
   firstMarketQuestion: string | null;
-  /** markets[0].description — used as resolution criteria when marketsCount > 1. */
+  /** Sub-market description — for multi-outcome parents, same picked sub-market as firstMarketQuestion. */
   firstMarketDescription: string | null;
   endDate: Date;
   endDateIso: string;
@@ -84,60 +89,170 @@ function num(v: unknown): number {
   return NaN;
 }
 
-/**
- * Parse one Gamma event; returns null if it fails structural filters.
- */
-export function tryParseGammaEvent(ev: unknown): ParsedGammaEvent | null {
-  if (!ev || typeof ev !== "object") return null;
-  const e = ev as Record<string, unknown>;
+/** Tiered minimum USD volume by days until resolution (see shortlist spec). */
+export function minVolumeForDays(daysToResolution: number | null | undefined): number {
+  if (daysToResolution == null || !Number.isFinite(daysToResolution) || daysToResolution <= 0) {
+    return 5000;
+  }
+  if (daysToResolution <= 7) return 1000;
+  if (daysToResolution <= 30) return 3000;
+  return 5000;
+}
 
-  if (e.active !== true || e.closed !== false) return null;
+function getGammaEventTitle(e: Record<string, unknown>): string {
+  const eventTitle = typeof e.title === "string" ? e.title : "";
+  return eventTitle.trim();
+}
 
-  const markets = e.markets;
-  if (!Array.isArray(markets) || markets.length < 1) return null;
-
-  const m0 = markets[0];
-  if (!m0 || typeof m0 !== "object") return null;
-  const m = m0 as Record<string, unknown>;
-
-  const opRaw = m.outcomePrices;
-  if (opRaw == null) return null;
-
-  const prices = parsePrices(opRaw as string | string[]);
-  if (prices.length !== 2) return null;
-
-  const yesDecimal = prices[0];
-  if (!Number.isFinite(yesDecimal) || yesDecimal < 0.1 || yesDecimal > 0.9) return null;
-
-  const volume = num(e.volume);
-  if (!Number.isFinite(volume) || volume <= 5000) return null;
-
+function getEndDateFromEvent(e: Record<string, unknown>): Date | null {
   const endRaw = e.endDate ?? e.endDateIso;
   if (endRaw == null || endRaw === "") return null;
   const endDate = new Date(String(endRaw));
-  if (isNaN(endDate.getTime())) return null;
+  return isNaN(endDate.getTime()) ? null : endDate;
+}
+
+function getDaysToResolutionForRawEvent(ev: unknown, now: Date): number | null {
+  if (!ev || typeof ev !== "object") return null;
+  const endDate = getEndDateFromEvent(ev as Record<string, unknown>);
+  if (!endDate) return null;
+  return getTimeBucket(now, endDate).daysToResolution ?? null;
+}
+
+function isBinarySettledOutcomePrices(opRaw: unknown): boolean {
+  const prices = parsePrices(opRaw as string | string[]);
+  if (prices.length !== 2) return false;
+  const a = prices[0];
+  const b = prices[1];
+  const near = (x: number, y: number) => Math.abs(x - y) < 1e-6;
+  return (near(a, 0) && near(b, 1)) || (near(a, 1) && near(b, 0));
+}
+
+/** True if every nested market is closed or has settled 0/1 outcome prices. */
+export function isEntirelyResolvedParentEvent(ev: unknown): boolean {
+  if (!ev || typeof ev !== "object") return false;
+  const e = ev as Record<string, unknown>;
+  const markets = e.markets;
+  if (!Array.isArray(markets) || markets.length === 0) return false;
+  return markets.every((m) => {
+    if (!m || typeof m !== "object") return false;
+    const mr = m as Record<string, unknown>;
+    if (mr.closed === true) return true;
+    return isBinarySettledOutcomePrices(mr.outcomePrices);
+  });
+}
+
+const PROB_MIN = 0.07;
+const PROB_MAX = 0.93;
+
+function passesProbabilityBand(yesDecimal: number): boolean {
+  return Number.isFinite(yesDecimal) && yesDecimal >= PROB_MIN && yesDecimal <= PROB_MAX;
+}
+
+function getYesDecimalFromMarket(m: Record<string, unknown>): number | null {
+  const opRaw = m.outcomePrices;
+  if (opRaw == null) return null;
+  const prices = parsePrices(opRaw as string | string[]);
+  if (prices.length !== 2) return null;
+  const yesDecimal = prices[0];
+  if (!Number.isFinite(yesDecimal) || !Number.isFinite(prices[1])) return null;
+  return yesDecimal;
+}
+
+/**
+ * Single binary sub-market: use it. Multiple: pick the sub-market whose YES price is closest to 50%
+ * (stable tie-break: earlier index wins).
+ */
+function pickPrimaryMarketForEvent(e: Record<string, unknown>): Record<string, unknown> | null {
+  const markets = e.markets;
+  if (!Array.isArray(markets) || markets.length < 1) return null;
+
+  type Cand = { m: Record<string, unknown>; yes: number; idx: number };
+  const candidates: Cand[] = [];
+  for (let i = 0; i < markets.length; i++) {
+    const raw = markets[i];
+    if (!raw || typeof raw !== "object") continue;
+    const m = raw as Record<string, unknown>;
+    const yes = getYesDecimalFromMarket(m);
+    if (yes == null) continue;
+    candidates.push({ m, yes, idx: i });
+  }
+  if (candidates.length === 0) return null;
+
+  if (markets.length === 1) return candidates[0].m;
+
+  let best = candidates[0];
+  let bestDist = Math.abs(best.yes - 0.5);
+  for (let j = 1; j < candidates.length; j++) {
+    const c = candidates[j];
+    const d = Math.abs(c.yes - 0.5);
+    if (d < bestDist - 1e-12) {
+      best = c;
+      bestDist = d;
+    }
+  }
+  return best.m;
+}
+
+/** Shape required before probability / volume / days filters (excludes noise & all-sub-resolved). */
+function passesGammaShell(e: Record<string, unknown>): boolean {
+  if (e.active !== true || e.closed !== false) return false;
+
+  const markets = e.markets;
+  if (!Array.isArray(markets) || markets.length < 1) return false;
+
+  if (pickPrimaryMarketForEvent(e) == null) return false;
 
   const id = e.id != null ? String(e.id) : "";
-  if (!id) return null;
+  if (!id) return false;
 
   const slug = typeof e.slug === "string" && e.slug.trim() ? e.slug.trim() : "";
-  if (!slug) return null;
+  if (!slug) return false;
 
-  const eventTitle = typeof e.title === "string" ? e.title : "";
-  if (!eventTitle.trim()) return null;
+  if (!getGammaEventTitle(e)) return false;
+
+  const endDate = getEndDateFromEvent(e);
+  if (!endDate) return false;
+
+  return true;
+}
+
+function getYesDecimalFromShellRow(e: Record<string, unknown>): number | null {
+  const m = pickPrimaryMarketForEvent(e);
+  if (!m) return null;
+  return getYesDecimalFromMarket(m);
+}
+
+function buildParsedGammaEventFromRow(e: Record<string, unknown>, yesDecimal: number): ParsedGammaEvent | null {
+  if (!passesGammaShell(e)) return null;
+
+  const primary = pickPrimaryMarketForEvent(e);
+  if (!primary) return null;
+
+  const markets = e.markets as unknown[];
+
+  const endDate = getEndDateFromEvent(e);
+  if (!endDate) return null;
+
+  const volume = num(e.volume);
+  if (!Number.isFinite(volume)) return null;
+
+  const id = String(e.id);
+  const slug = (e.slug as string).trim();
 
   const eventDescription =
     typeof e.description === "string" ? e.description : e.description == null ? null : String(e.description);
 
   const marketsCount = markets.length;
   const firstMarketQuestion =
-    typeof m.question === "string" && m.question.trim() ? m.question.trim() : null;
+    typeof primary.question === "string" && primary.question.trim()
+      ? primary.question.trim()
+      : null;
   const firstMarketDescription =
-    typeof m.description === "string"
-      ? m.description
-      : m.description == null
+    typeof primary.description === "string"
+      ? primary.description
+      : primary.description == null
         ? null
-        : String(m.description);
+        : String(primary.description);
 
   const startRaw = e.startDate ?? e.startDateIso;
   const startDate =
@@ -159,7 +274,7 @@ export function tryParseGammaEvent(ev: unknown): ParsedGammaEvent | null {
 
   return {
     polymarketId: id,
-    title: eventTitle.trim(),
+    title: getGammaEventTitle(e),
     slug,
     description: eventDescription,
     marketsCount,
@@ -175,6 +290,33 @@ export function tryParseGammaEvent(ev: unknown): ParsedGammaEvent | null {
     yesProbability: yesDecimal,
     market_url
   };
+}
+
+/**
+ * Parse one Gamma event; returns null if it fails the same filters as the shortlist pipeline
+ * (noise, resolved parent, shell, probability 7–93%, tiered volume, days_to_resolution > 0).
+ */
+export function tryParseGammaEvent(ev: unknown, nowArg?: Date): ParsedGammaEvent | null {
+  const now = nowArg ?? new Date();
+  if (!ev || typeof ev !== "object") return null;
+  const e = ev as Record<string, unknown>;
+
+  if (e.active !== true || e.closed !== false) return null;
+  if (isNoiseMarket(getGammaEventTitle(e))) return null;
+  if (isEntirelyResolvedParentEvent(ev)) return null;
+  if (!passesGammaShell(e)) return null;
+
+  const yesDecimal = getYesDecimalFromShellRow(e);
+  if (yesDecimal == null || !passesProbabilityBand(yesDecimal)) return null;
+
+  const endDate = getEndDateFromEvent(e)!;
+  const { daysToResolution } = getTimeBucket(now, endDate);
+  if (daysToResolution == null || daysToResolution <= 0) return null;
+
+  const volume = num(e.volume);
+  if (!Number.isFinite(volume) || volume < minVolumeForDays(daysToResolution)) return null;
+
+  return buildParsedGammaEventFromRow(e, yesDecimal);
 }
 
 export interface PipelineStepTrace {
@@ -210,7 +352,21 @@ export function createEmptyPipelineTrace(): PipelineStepTrace {
   };
 }
 
-async function fetchRawEvents(): Promise<{
+function mergeEventsById(lists: unknown[][]): unknown[] {
+  const map = new Map<string, unknown>();
+  for (const list of lists) {
+    for (const ev of list) {
+      if (!ev || typeof ev !== "object") continue;
+      const id = (ev as Record<string, unknown>).id;
+      if (id == null) continue;
+      const key = String(id);
+      if (!map.has(key)) map.set(key, ev);
+    }
+  }
+  return [...map.values()];
+}
+
+async function fetchEventsList(url: string): Promise<{
   events: unknown[];
   status: number;
   ok: boolean;
@@ -218,7 +374,7 @@ async function fetchRawEvents(): Promise<{
 }> {
   let status = 0;
   try {
-    const res = await fetch(EVENTS_URL, { cache: "no-store" });
+    const res = await fetch(url, { cache: "no-store" });
     status = res.status;
     if (!res.ok) {
       return { events: [], status, ok: false, parseError: null };
@@ -234,14 +390,112 @@ async function fetchRawEvents(): Promise<{
   }
 }
 
+/**
+ * Resolving in next 72h: try end_date_min/max; on HTTP failure fall back to endDate order + 1–3d filter.
+ */
+async function fetchEventsResolving72hOrFallback(now: Date): Promise<{
+  events: unknown[];
+  status: number;
+  ok: boolean;
+  parseError: string | null;
+  usedEndDateFallback: boolean;
+}> {
+  const nowIso = now.toISOString();
+  const maxIso = new Date(now.getTime() + 72 * 3600 * 1000).toISOString();
+  const primaryUrl =
+    `${EVENTS_ACTIVE_BASE}&end_date_min=${encodeURIComponent(nowIso)}&end_date_max=${encodeURIComponent(maxIso)}`;
+
+  const primary = await fetchEventsList(primaryUrl);
+  if (!primary.ok) {
+    const fb = await fetchEventsList(EVENTS_END_DATE_FALLBACK);
+    if (!fb.ok) {
+      return {
+        events: [],
+        status: fb.status || primary.status,
+        ok: false,
+        parseError: fb.parseError ?? primary.parseError,
+        usedEndDateFallback: true
+      };
+    }
+    const filtered = fb.events.filter((ev) => {
+      const d = getDaysToResolutionForRawEvent(ev, now);
+      return d != null && d >= 1 && d <= 3;
+    });
+    return {
+      events: filtered,
+      status: fb.status,
+      ok: fb.ok && fb.parseError == null,
+      parseError: fb.parseError,
+      usedEndDateFallback: true
+    };
+  }
+
+  return {
+    events: primary.events,
+    status: primary.status,
+    ok: primary.ok && primary.parseError == null,
+    parseError: primary.parseError,
+    usedEndDateFallback: false
+  };
+}
+
+async function fetchRawEventsQuad(now: Date): Promise<{
+  events: unknown[];
+  statuses: number[];
+  ok: boolean;
+  parseError: string | null;
+  usedEndDateFallback: boolean;
+}> {
+  const [volRes, startRes, liqRes, soonRes] = await Promise.all([
+    fetchEventsList(EVENTS_MOST_ACTIVE_TODAY),
+    fetchEventsList(EVENTS_NEWEST),
+    fetchEventsList(EVENTS_HIGH_LIQUIDITY),
+    fetchEventsResolving72hOrFallback(now)
+  ]);
+
+  const merged = mergeEventsById([
+    volRes.events,
+    startRes.events,
+    liqRes.events,
+    soonRes.events
+  ]);
+  const statuses = [volRes.status, startRes.status, liqRes.status, soonRes.status];
+  const parseError =
+    volRes.parseError ??
+    startRes.parseError ??
+    liqRes.parseError ??
+    soonRes.parseError ??
+    null;
+  const ok =
+    volRes.ok &&
+    startRes.ok &&
+    liqRes.ok &&
+    soonRes.ok &&
+    volRes.parseError == null &&
+    startRes.parseError == null &&
+    liqRes.parseError == null &&
+    soonRes.parseError == null;
+
+  return {
+    events: merged,
+    statuses,
+    ok,
+    parseError,
+    usedEndDateFallback: soonRes.usedEndDateFallback
+  };
+}
+
+/** Minimal fields sent to Gemini (no volume/endDate ISO — saves input tokens). */
 export interface StrippedForGemini {
   id: string;
   title: string;
-  endDate: string;
-  volume: number;
   crowd_price: number;
   /** Integer days until resolution (for time-horizon selection rules). */
   days_to_resolution: number;
+  /** Present when Gamma provided a category string. */
+  category?: string;
+  /** Reserved if a geography label is ever supplied upstream (usually omitted). */
+  market_geography?: string;
 }
 
 export interface GeminiSelectionRow {
@@ -257,7 +511,8 @@ export interface GeminiSelectionRow {
 /** Single Gemini call: select N events with geography + category per row. */
 async function callGeminiForSelection(
   strippedList: StrippedForGemini[],
-  wantCount: number
+  wantCount: number,
+  retryAttempt = 0
 ): Promise<GeminiSelectionRow[]> {
   const apiKey = process.env.GOOGLE_AI_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_AI_API_KEY is not set");
@@ -279,14 +534,42 @@ async function callGeminiForSelection(
         },
         contents: [{ parts: [{ text: instruction + userContent }] }],
         generationConfig: {
-          maxOutputTokens: 8192,
-          temperature: 0.4
+          maxOutputTokens: 4096,
+          temperature: 0.2,
+          // 2.5 Flash charges thinking against maxOutputTokens unless disabled — was truncating JSON mid-array.
+          thinkingConfig: {
+            thinkingBudget: 0
+          }
         }
       })
     }
   );
 
   const json = await res.json();
+
+  if (res.status === 429) {
+    if (retryAttempt === 0) {
+      console.log(
+        "[shortlist][Gemini] QUOTA ERROR 429 — waiting 60 seconds then retrying once"
+      );
+      await new Promise((r) => setTimeout(r, 60_000));
+      return callGeminiForSelection(strippedList, wantCount, 1);
+    }
+    const bodySnippet = JSON.stringify(json, null, 2).slice(0, 3500);
+    console.error(
+      "[shortlist][Gemini] HTTP 429 after retry — full body:\n",
+      bodySnippet
+    );
+    const time = new Date().toISOString();
+    await sendTelegramMessage(
+      `⚠️ Polycast Gemini rate limited (429) after retry\n\n${bodySnippet}\n\nTime: ${time}`,
+      { plain: true }
+    );
+    throw new Error(
+      "Gemini API rate limited (429) after one 60s retry — check quota or try again later"
+    );
+  }
+
   if (!res.ok) {
     const bodySnippet = JSON.stringify(json, null, 2).slice(0, 3500);
     console.error(
@@ -294,10 +577,7 @@ async function callGeminiForSelection(
       bodySnippet
     );
     const time = new Date().toISOString();
-    const telegramPrefix =
-      res.status === 429
-        ? "⚠️ Polycast Gemini rate limited (429)"
-        : `⚠️ Polycast Gemini API error (HTTP ${res.status})`;
+    const telegramPrefix = `⚠️ Polycast Gemini API error (HTTP ${res.status})`;
     await sendTelegramMessage(
       `${telegramPrefix}\n\n${bodySnippet}\n\nTime: ${time}`,
       { plain: true }
@@ -308,12 +588,16 @@ async function callGeminiForSelection(
   const text =
     json?.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text).join("") ?? "";
 
+  console.log("[shortlist][Gemini] Raw response length:", text.length);
   console.log(
-    "[shortlist][Gemini] Raw model text (before parseGeminiJsonArray), length=",
-    text.length,
-    ":\n",
-    text
+    "[shortlist][Gemini] Raw response first 500 chars:",
+    text.slice(0, 500)
   );
+  console.log(
+    "[shortlist][Gemini] Raw response last 200 chars:",
+    text.slice(-200)
+  );
+
   if (!text.trim()) {
     console.error(
       "[shortlist][Gemini] Empty text — full API JSON (truncated):\n",
@@ -321,7 +605,18 @@ async function callGeminiForSelection(
     );
   }
 
-  const parsed = parseGeminiJsonArray(text);
+  const { items: parsed, parseError } = parseGeminiJsonArrayDetailed(text);
+  console.log("[shortlist][Gemini] Parsed object count:", parsed.length);
+  if (parseError) {
+    console.error("[shortlist][Gemini] JSON parse failed — full error:", parseError);
+  }
+
+  if (parsed.length < 10) {
+    console.warn(
+      `[shortlist][Gemini] WARNING: Only ${parsed.length} markets returned — expected 20. Raw text follows:\n${text}`
+    );
+  }
+
   const arr = Array.isArray(parsed) ? parsed : [];
   return arr
     .map((o: Record<string, unknown>) => {
@@ -358,14 +653,15 @@ export interface GeminiShortlistResult {
 function toStripped(e: ParsedGammaEvent, now: Date): StrippedForGemini {
   const { daysToResolution } = getTimeBucket(now, e.endDate);
   const d = daysToResolution ?? 0;
-  return {
+  const row: StrippedForGemini = {
     id: e.polymarketId,
     title: e.title,
-    endDate: e.endDateIso,
-    volume: e.volume,
     crowd_price: e.crowd_price,
     days_to_resolution: d
   };
+  const cat = e.category?.trim();
+  if (cat) row.category = cat;
+  return row;
 }
 
 /** 1–30 days inclusive (post “positive days” pool filter). */
@@ -517,9 +813,12 @@ export async function buildGeminiShortlist(
   const excludedSet = new Set(excludedPolymarketIds);
   const t = traceIn ?? createEmptyPipelineTrace();
 
-  const rawRes = await fetchRawEvents();
-  t.polymarketHttpStatus = rawRes.status;
-  t.polymarketFetchOk = rawRes.ok && !rawRes.parseError;
+  const fetchAt = new Date();
+  const rawRes = await fetchRawEventsQuad(fetchAt);
+  const badStatuses = rawRes.statuses.filter((s) => s >= 400);
+  t.polymarketHttpStatus =
+    badStatuses.length > 0 ? Math.max(...badStatuses) : 200;
+  t.polymarketFetchOk = rawRes.ok && rawRes.parseError == null;
   t.polymarketRawCount = rawRes.events.length;
   if (rawRes.parseError) {
     t.polymarketFetchOk = false;
@@ -527,7 +826,7 @@ export async function buildGeminiShortlist(
   }
 
   console.log(
-    `[pipeline] Step 2: Polymarket returned ${rawRes.events.length} events (HTTP ${rawRes.status})`
+    `[pipeline] Step 2: Polymarket quad fetch merged ${rawRes.events.length} unique events (HTTP ${t.polymarketHttpStatus})`
   );
 
   if (rawRes.parseError) {
@@ -535,14 +834,17 @@ export async function buildGeminiShortlist(
     t.polymarketError = rawRes.parseError;
     console.error("[pipeline] Polymarket response JSON error:", rawRes.parseError);
     await sendTelegramMessage(
-      `⚠️ Polycast Polymarket API response parse error (HTTP ${rawRes.status})\n\n${rawRes.parseError}\nTime: ${new Date().toISOString()}`,
+      `⚠️ Polycast Polymarket API response parse error (HTTP ${t.polymarketHttpStatus})\n\n${rawRes.parseError}\nTime: ${new Date().toISOString()}`,
       { plain: true }
     );
   } else if (!rawRes.ok) {
-    t.polymarketError = t.polymarketError ?? `HTTP ${rawRes.status}`;
-    console.error("[pipeline] Polymarket /events request failed:", rawRes.status);
+    t.polymarketError = t.polymarketError ?? `HTTP ${t.polymarketHttpStatus}`;
+    console.error(
+      "[pipeline] Polymarket /events request failed:",
+      rawRes.statuses.join(", ")
+    );
     await sendTelegramMessage(
-      `⚠️ Polycast Polymarket API error\n\n/events returned HTTP ${rawRes.status}\nTime: ${new Date().toISOString()}`,
+      `⚠️ Polycast Polymarket API error\n\n/events returned HTTP ${t.polymarketHttpStatus}\nTime: ${new Date().toISOString()}`,
       { plain: true }
     );
   } else if (rawRes.events.length === 0) {
@@ -551,47 +853,109 @@ export async function buildGeminiShortlist(
     );
   }
 
-  const raw = rawRes.events;
+  let poolRows = rawRes.events;
 
-  const structural: ParsedGammaEvent[] = [];
-  for (const row of raw) {
-    const p = tryParseGammaEvent(row);
-    if (p) structural.push(p);
-  }
-  t.structuralCount = structural.length;
+  console.log(`[shortlist] After fetch + dedup: ${poolRows.length} events`);
 
+  const noiseRemovedTitles: string[] = [];
+  poolRows = poolRows.filter((ev) => {
+    if (!ev || typeof ev !== "object") return false;
+    const e = ev as Record<string, unknown>;
+    const title = getGammaEventTitle(e);
+    if (isNoiseMarket(title)) {
+      noiseRemovedTitles.push(title || "(empty)");
+      return false;
+    }
+    return true;
+  });
+  const removedNoise = noiseRemovedTitles.length;
   console.log(
-    `[pipeline] Step 3: After structural filters: ${structural.length} events`
+    `[shortlist] After noise filter: ${poolRows.length} events (removed ${removedNoise} noise markets)`
   );
-  if (raw.length > 0 && structural.length === 0) {
-    console.error(
-      "[pipeline] All Polymarket events failed structural filters (0 passed)"
-    );
+  for (const title of noiseRemovedTitles) {
+    console.log(`[shortlist] Noise removed: ${title}`);
   }
+
+  poolRows = poolRows.filter((ev) => !isEntirelyResolvedParentEvent(ev));
+  console.log(
+    `[shortlist] After closed sub-market filter: ${poolRows.length} events`
+  );
 
   const nowForFilter = new Date();
-  const afterPositiveDays = structural.filter((p) => {
-    const { daysToResolution } = getTimeBucket(nowForFilter, p.endDate);
+
+  const afterProb = poolRows.filter((ev) => {
+    if (!ev || typeof ev !== "object") return false;
+    const e = ev as Record<string, unknown>;
+    if (!passesGammaShell(e)) return false;
+    const yes = getYesDecimalFromShellRow(e);
+    return yes != null && passesProbabilityBand(yes);
+  });
+  console.log(
+    `[shortlist] After probability filter (7-93%): ${afterProb.length} events`
+  );
+
+  const afterVol = afterProb.filter((ev) => {
+    const e = ev as Record<string, unknown>;
+    const endDate = getEndDateFromEvent(e);
+    if (!endDate) return false;
+    const { daysToResolution } = getTimeBucket(nowForFilter, endDate);
+    const volume = num(e.volume);
+    if (!Number.isFinite(volume)) return false;
+    return volume >= minVolumeForDays(daysToResolution);
+  });
+  console.log(`[shortlist] After volume filter: ${afterVol.length} events`);
+
+  const afterDaysRows = afterVol.filter((ev) => {
+    const e = ev as Record<string, unknown>;
+    const endDate = getEndDateFromEvent(e);
+    if (!endDate) return false;
+    const { daysToResolution } = getTimeBucket(nowForFilter, endDate);
     return daysToResolution != null && daysToResolution > 0;
   });
-  t.daysCount = afterPositiveDays.length;
+  console.log(
+    `[shortlist] After days_to_resolution > 0 filter: ${afterDaysRows.length} events`
+  );
+
+  const structural: ParsedGammaEvent[] = [];
+  for (const row of afterDaysRows) {
+    const e = row as Record<string, unknown>;
+    const yes = getYesDecimalFromShellRow(e);
+    if (yes == null) continue;
+    const p = buildParsedGammaEventFromRow(e, yes);
+    if (p) structural.push(p);
+  }
+
+  t.structuralCount = afterVol.length;
+  t.daysCount = structural.length;
 
   console.log(
-    `[pipeline] Step 4: After days_to_resolution filter: ${afterPositiveDays.length} events`
+    `[pipeline] Step 3: After structural filters (pre–days): ${afterVol.length} events`
   );
-  if (structural.length > 0 && afterPositiveDays.length === 0) {
+  if (poolRows.length > 0 && afterVol.length === 0) {
     console.error(
-      "[pipeline] After structural filters, 0 events remained with days_to_resolution > 0"
+      "[pipeline] All Polymarket events failed structural filters (0 passed volume/probability shell)"
     );
   }
 
-  const pool = afterPositiveDays.filter(
+  console.log(
+    `[pipeline] Step 4: After days_to_resolution filter: ${structural.length} events`
+  );
+  if (afterVol.length > 0 && structural.length === 0) {
+    console.error(
+      "[pipeline] After volume filter, 0 events remained with days_to_resolution > 0"
+    );
+  }
+
+  const pool = structural.filter(
     (p) => !existingSet.has(p.polymarketId) && !excludedSet.has(p.polymarketId)
   );
   t.dedupCount = pool.length;
 
+  console.log(
+    `[shortlist] After dedup against DB: ${pool.length} events — sending to Gemini`
+  );
   console.log(`[pipeline] Step 5: After dedup: ${pool.length} events`);
-  if (afterPositiveDays.length > 0 && pool.length === 0) {
+  if (structural.length > 0 && pool.length === 0) {
     console.error(
       "[pipeline] Pool is empty after dedup — all candidates may already be predicted, held, or rejected"
     );
@@ -699,9 +1063,9 @@ export async function buildGeminiShortlist(
   return {
     markets,
     debug: {
-      totalFetched: raw.length,
-      afterStructuralFilters: structural.length,
-      afterDaysToResolutionFilter: afterPositiveDays.length,
+      totalFetched: rawRes.events.length,
+      afterStructuralFilters: afterVol.length,
+      afterDaysToResolutionFilter: structural.length,
       afterDedup: pool.length,
       afterGemini: markets.length
     }
