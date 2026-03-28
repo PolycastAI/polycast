@@ -62,8 +62,8 @@ export interface ParsedGammaEvent {
   /** Gamma id of the picked sub-market (null if missing on payload). */
   subMarketId: string | null;
   /**
-   * Resolution instant for DB `markets.resolution_date`: after shortlist build, prefer
-   * `GET /markets/{subMarketId}` (canonical row); embedded `/events` dates are a fallback only.
+   * Resolution instant for DB `markets.resolution_date`: `GET /markets/{subMarketId}` plus the same
+   * criteria-vs-Gamma merge as embedded rows (`pickResolutionInstantFromSubMarketRecord`).
    */
   endDate: Date;
   endDateIso: string;
@@ -141,6 +141,96 @@ function parseResolutionInstantFromGammaRecord(
     if (!isNaN(d.getTime())) return d;
   }
   return null;
+}
+
+/** Month names for Polymarket criteria lines ("by May 31, 2026, 11:59 PM ET"). */
+const CRITERIA_MONTH_TO_NUM: Record<string, number> = {
+  january: 1,
+  jan: 1,
+  february: 2,
+  feb: 2,
+  march: 3,
+  mar: 3,
+  april: 4,
+  apr: 4,
+  may: 5,
+  june: 6,
+  jun: 6,
+  july: 7,
+  jul: 7,
+  august: 8,
+  aug: 8,
+  september: 9,
+  sep: 9,
+  sept: 9,
+  october: 10,
+  oct: 10,
+  november: 11,
+  nov: 11,
+  december: 12,
+  dec: 12
+};
+
+const CRITERIA_MONTH_ALT = Object.keys(CRITERIA_MONTH_TO_NUM).join("|");
+
+/**
+ * Polymarket often ships wrong `endDate` on nested Gamma rows while the same object’s
+ * `description` states the binding deadline ("by May 31, 2026, 11:59 PM ET"). This is not
+ * title guessing — it reads the official criteria copy only.
+ */
+function parseResolutionDeadlineFromPolymarketDescription(
+  text: string | null | undefined
+): Date | null {
+  if (text == null || typeof text !== "string" || !text.trim()) return null;
+  const re = new RegExp(
+    `\\bby\\s+(${CRITERIA_MONTH_ALT})\\s+(\\d{1,2})(?:st|nd|rd|th)?,\\s*(20\\d{2})\\b`,
+    "i"
+  );
+  const m = re.exec(text);
+  if (!m) return null;
+  const month = CRITERIA_MONTH_TO_NUM[m[1]!.toLowerCase()];
+  const day = parseInt(m[2]!, 10);
+  const year = parseInt(m[3]!, 10);
+  if (month == null || !Number.isFinite(day) || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, month - 1, day, 23, 59, 59, 999));
+  return isNaN(d.getTime()) ? null : d;
+}
+
+const DESCRIPTION_VS_GAMMA_DRIFT_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Resolution instant for one **nested market** or **GET /markets** row: combine Gamma timestamps
+ * with criteria text when Gamma is inconsistent (common on multi-outcome parents).
+ * Parent **event** rows must not use this — umbrella descriptions can mention other deadlines.
+ */
+function pickResolutionInstantFromSubMarketRecord(
+  rec: Record<string, unknown>
+): Date | null {
+  const api = parseResolutionInstantFromGammaRecord(rec);
+  const descText =
+    typeof rec.description === "string" && rec.description.trim()
+      ? rec.description
+      : "";
+  const fromDesc = parseResolutionDeadlineFromPolymarketDescription(descText);
+  const mid = rec.id != null ? String(rec.id) : "?";
+
+  if (fromDesc && api) {
+    const drift = Math.abs(fromDesc.getTime() - api.getTime());
+    if (drift > DESCRIPTION_VS_GAMMA_DRIFT_MS) {
+      console.warn(
+        `[shortlist] resolution_date_criteria_vs_gamma: market_id=${mid} gamma=${api.toISOString()} description_deadline=${fromDesc.toISOString()} (using description)`
+      );
+      return fromDesc;
+    }
+    return api;
+  }
+  if (fromDesc && !api) {
+    console.warn(
+      `[shortlist] resolution_date_criteria_only: market_id=${mid} gamma_endDate=null using_description=${fromDesc.toISOString()}`
+    );
+    return fromDesc;
+  }
+  return api;
 }
 
 /** One Gamma sub-market chosen for an event; all fields come from the same `raw` row. */
@@ -251,15 +341,15 @@ function getSubMarketEndDateRawString(m: Record<string, unknown>): string | null
 }
 
 /**
- * Authoritative resolution time for a sub-market: that row's `endDate`/`endDateIso` only,
- * falling back to the parent event end date when the market omits it. No question-text parsing.
- * DB `markets.resolution_date` / ShortlistMarket.resolutionDate come from this path only.
+ * Resolution time for a sub-market row: Gamma `endDate` / `endDateIso` / `gameStartTime`, aligned
+ * with the same row’s `description` when Polymarket’s top-level dates disagree with criteria text.
+ * Parent event: API timestamps only (no description — umbrella copy is not per-outcome).
  */
 function getSubMarketResolutionEndDate(
   m: Record<string, unknown>,
   e: Record<string, unknown>
 ): Date | null {
-  const fromMarket = parseResolutionInstantFromGammaRecord(m);
+  const fromMarket = pickResolutionInstantFromSubMarketRecord(m);
   if (fromMarket) return fromMarket;
   return parseResolutionInstantFromGammaRecord(e);
 }
@@ -508,12 +598,12 @@ async function hydrateParsedEventEndDateFromSubMarketApi(
       return p;
     }
     const rec = gm as unknown as Record<string, unknown>;
-    const d = parseResolutionInstantFromGammaRecord(rec);
+    const d = pickResolutionInstantFromSubMarketRecord(rec);
     if (!d || isNaN(d.getTime())) return p;
     const driftMs = Math.abs(d.getTime() - p.endDate.getTime());
     if (p.marketsCount > 1 && driftMs > 60_000) {
       console.warn(
-        `[shortlist] resolution_date_sub_market_api: event_id=${p.polymarketId} sub_market_id=${sid} events_embedded=${p.endDate.toISOString()} markets_endpoint=${d.toISOString()}`
+        `[shortlist] resolution_date_sub_market_api: event_id=${p.polymarketId} sub_market_id=${sid} before_hydrate=${p.endDate.toISOString()} after_markets_merge=${d.toISOString()}`
       );
     }
     return { ...p, endDate: d, endDateIso: d.toISOString() };
