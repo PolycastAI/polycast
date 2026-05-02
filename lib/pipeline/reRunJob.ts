@@ -1,7 +1,8 @@
 /* eslint-disable no-console */
 
 import { supabaseAdmin } from "@/lib/supabase/server";
-import { fetchMarketById } from "@/lib/polymarket/gamma";
+import { fetchGammaForMarketCrowdPrice, normalizeAndValidateCrowdPriceForStorage } from "@/lib/pipeline/crowdPrice";
+import { getYesProbabilityDecimal } from "@/lib/polymarket/gamma";
 import { renderPromptV1, PROMPT_VERSION } from "@/lib/ai/promptV1";
 import { callModelWithRetry, ModelName } from "@/lib/ai/models";
 import {
@@ -15,29 +16,6 @@ function classifySignal(edge: number): Signal {
   if (edge > 10) return "BET YES";
   if (edge < -10) return "BET NO";
   return "PASS";
-}
-
-function parseYesPrice(gamma: any): number {
-  const raw = gamma.outcomePrices;
-  if (!raw) return 0.5;
-  let arr: number[];
-  if (Array.isArray(raw)) {
-    arr = raw.map((p: unknown) => Number(p));
-  } else {
-    try {
-      arr = JSON.parse(raw).map((p: unknown) => Number(p));
-    } catch {
-      return 0.5;
-    }
-  }
-  const outcomes = gamma.outcomes;
-  let yesIdx = 0;
-  if (outcomes) {
-    const o = Array.isArray(outcomes) ? outcomes : JSON.parse(outcomes);
-    yesIdx = o.findIndex((x: string) => String(x).toLowerCase() === "yes");
-    if (yesIdx === -1) yesIdx = 0;
-  }
-  return arr[yesIdx] ?? 0.5;
 }
 
 export async function runReRunJob() {
@@ -60,7 +38,9 @@ export async function runReRunJob() {
 
   const { data: markets, error: marketError } = await supabaseAdmin
     .from("markets")
-    .select("id, polymarket_id, title, social_title, resolution_date, category, market_url")
+    .select(
+      "id, polymarket_id, sub_market_id, title, social_title, resolution_date, category, market_url"
+    )
     .in("id", marketIds);
 
   if (marketError || !markets?.length) return;
@@ -69,10 +49,19 @@ export async function runReRunJob() {
     const market = (markets as any[]).find((m) => m.id === scheduleRow.market_id);
     if (!market) continue;
 
-    const gamma = await fetchMarketById(market.polymarket_id);
+    const gamma = await fetchGammaForMarketCrowdPrice(market);
     if (!gamma || (gamma as any).closed) continue;
 
-    const crowdPrice = parseYesPrice(gamma);
+    let crowdPrice: number;
+    try {
+      crowdPrice = normalizeAndValidateCrowdPriceForStorage(
+        getYesProbabilityDecimal(gamma) ?? 0.5,
+        `re-run market_id=${market.id}`
+      );
+    } catch (err) {
+      console.error(`Re-run skip market ${market.id}: crowd price`, err);
+      continue;
+    }
     const crowdPricePercent = Math.round(crowdPrice * 100);
 
     const resolutionDateIso = market.resolution_date

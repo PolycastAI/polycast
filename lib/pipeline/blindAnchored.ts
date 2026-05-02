@@ -13,6 +13,11 @@ import {
   postPredictionToBluesky,
   PredictionSummaryForPost
 } from "@/lib/social/bluesky";
+import {
+  fetchGammaForMarketCrowdPrice,
+  normalizeAndValidateCrowdPriceForStorage
+} from "@/lib/pipeline/crowdPrice";
+import { getYesProbabilityDecimal } from "@/lib/polymarket/gamma";
 
 type Signal = "BET YES" | "BET NO" | "PASS";
 
@@ -193,7 +198,11 @@ export async function runBlindAndAnchoredForMarketWithId(
   }[] = [];
 
   for (const model of models) {
-    const crowdPricePercent = Math.round(m.probability * 100);
+      const crowdDecimal = normalizeAndValidateCrowdPriceForStorage(
+        m.probability,
+        `blind prompt polymarket_id=${m.polymarketId}`
+      );
+      const crowdPricePercent = Math.round(crowdDecimal * 100);
     const blindPrompt = renderPromptV1({
       ...basePromptContext,
       crowd_price_percent: undefined
@@ -219,7 +228,7 @@ export async function runBlindAndAnchoredForMarketWithId(
           days_to_resolution: m.daysToResolution,
           time_bucket: m.timeBucket,
           blind_estimate: estimate,
-          crowd_price_at_time: m.probability,
+          crowd_price_at_time: crowdDecimal,
           edge,
           signal,
           resolved: false,
@@ -625,12 +634,13 @@ export async function runPromptsForApprovedMarkets() {
     return;
   }
   const { getTimeBucket } = await import("@/lib/markets/timeBuckets");
-  const { fetchMarketById } = await import("@/lib/polymarket/gamma");
   await ensurePromptVersionRow();
 
   const { data: approved, error } = await supabaseAdmin
     .from("markets")
-    .select("id, polymarket_id, title, social_title, resolution_date, category, market_url")
+    .select(
+      "id, polymarket_id, sub_market_id, title, social_title, resolution_date, category, market_url"
+    )
     .eq("status", "approved");
 
   if (error || !approved?.length) {
@@ -640,16 +650,25 @@ export async function runPromptsForApprovedMarkets() {
 
   const now = new Date();
   for (const market of approved as any[]) {
-    const gamma = await fetchMarketById(market.polymarket_id);
+    const gamma = await fetchGammaForMarketCrowdPrice(market);
     if (!gamma || (gamma as any).closed) continue;
-    const outcomes = (gamma as any).outcomes;
-    const prices = (gamma as any).outcomePrices;
-    let prob = 0.5;
-    if (outcomes && prices) {
-      const o = Array.isArray(outcomes) ? outcomes : JSON.parse(outcomes);
-      const p = Array.isArray(prices) ? prices : JSON.parse(prices);
-      const yesIdx = o.findIndex((x: string) => String(x).toLowerCase() === "yes");
-      if (yesIdx >= 0 && p[yesIdx] != null) prob = Number(p[yesIdx]);
+    let prob: number;
+    try {
+      prob = normalizeAndValidateCrowdPriceForStorage(
+        getYesProbabilityDecimal(gamma) ?? 0.5,
+        `approved prompts market_id=${market.id} polymarket_id=${market.polymarket_id}`
+      );
+    } catch (err) {
+      console.error(
+        `[pipeline] Skipping approved market ${market.id}: invalid crowd price from Gamma`,
+        err
+      );
+      await logErrorToDb({
+        job: "run_prompts_approved",
+        marketId: market.id,
+        error: err
+      });
+      continue;
     }
     const vol = (gamma as any).volume ? Number((gamma as any).volume) : 0;
     const resolutionDate = market.resolution_date
@@ -686,27 +705,29 @@ export async function runPromptsForApprovedMarkets() {
 /** Run prompt pipeline for a single market (e.g. after Approve in admin). */
 export async function runPromptsForMarketId(marketId: string): Promise<void> {
   const { getTimeBucket } = await import("@/lib/markets/timeBuckets");
-  const { fetchMarketById } = await import("@/lib/polymarket/gamma");
   await ensurePromptVersionRow();
   const { data: market, error } = await supabaseAdmin
     .from("markets")
-    .select("id, polymarket_id, title, social_title, resolution_date, category, market_url")
+    .select(
+      "id, polymarket_id, sub_market_id, title, social_title, resolution_date, category, market_url"
+    )
     .eq("id", marketId)
     .single();
   if (error || !market) throw new Error("Market not found");
-  const gamma = await fetchMarketById((market as any).polymarket_id);
-  let prob = 0.5;
+  const gamma = await fetchGammaForMarketCrowdPrice(market as any);
+  let prob: number;
   let vol = 0;
   if (gamma && !(gamma as any).closed) {
-    const outcomes = (gamma as any).outcomes;
-    const prices = (gamma as any).outcomePrices;
-    if (outcomes && prices) {
-      const o = Array.isArray(outcomes) ? outcomes : JSON.parse(outcomes);
-      const p = Array.isArray(prices) ? prices : JSON.parse(prices);
-      const yesIdx = o.findIndex((x: string) => String(x).toLowerCase() === "yes");
-      if (yesIdx >= 0 && p[yesIdx] != null) prob = Number(p[yesIdx]);
-    }
+    prob = normalizeAndValidateCrowdPriceForStorage(
+      getYesProbabilityDecimal(gamma) ?? 0.5,
+      `runPromptsForMarketId market_id=${marketId}`
+    );
     vol = (gamma as any).volume ? Number((gamma as any).volume) : 0;
+  } else {
+    prob = normalizeAndValidateCrowdPriceForStorage(
+      0.5,
+      `runPromptsForMarketId missing_gamma market_id=${marketId}`
+    );
   }
   const resolutionDate = (market as any).resolution_date
     ? new Date((market as any).resolution_date)

@@ -29,7 +29,9 @@ function parsePrices(raw: string | string[] | null | undefined): number[] {
   }
 }
 
-function getYesPrice(m: GammaMarket): number | null {
+/** YES outcome probability as a decimal in \([0,1]\) from Gamma \`outcomes\` / \`outcomePrices\` order. */
+export function getYesProbabilityDecimal(m: GammaMarket | null | undefined): number | null {
+  if (!m) return null;
   const outcomes = parseOutcomes(m.outcomes);
   const prices = parsePrices(m.outcomePrices);
   if (outcomes.length !== 2 || prices.length !== 2) return null;
@@ -37,6 +39,10 @@ function getYesPrice(m: GammaMarket): number | null {
   if (yesIdx === -1) return null;
   const v = prices[yesIdx];
   return Number.isFinite(v) ? v : null;
+}
+
+function getYesPrice(m: GammaMarket): number | null {
+  return getYesProbabilityDecimal(m);
 }
 
 /** Fetch a single event by id for endDate fallback */
